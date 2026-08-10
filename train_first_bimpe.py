@@ -72,7 +72,7 @@ def main(config_path):
         raise FileNotFoundError(
             f"OOD text file not found: {OOD_data}. "
             "Copy Data/OOD_texts.txt from the StyleTTS2 repo into the config path, "
-            "or run: python prepare_bimpe_data.py --ensure_ood"
+            "or run: python scripts/prepare_bimpe_data.py --ensure_ood"
         )
 
     max_len = config.get('max_len', 400)

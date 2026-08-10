@@ -4,9 +4,9 @@
 MP4 needs ffmpeg on PATH (pydub).
 
 Usage:
-  python cut_and_merge_wav.py input.wav -o output.wav
-  python cut_and_merge_wav.py input.mp4 -o output.wav
-  python cut_and_merge_wav.py input.mp4 -o output.wav --sr 24000
+  python scripts/cut_and_merge_wav.py input.wav -o output.wav
+  python scripts/cut_and_merge_wav.py input.mp4 -o output.wav
+  python scripts/cut_and_merge_wav.py input.mp4 -o output.wav --sr 24000
 """
 
 from __future__ import annotations

@@ -6,9 +6,9 @@ Requires ffmpeg on PATH (pydub uses it for m4a decode):
   Ubuntu: sudo apt-get install -y ffmpeg
 
 Examples:
-  python m4a_to_wav.py recording.m4a
-  python m4a_to_wav.py ./input_dir -o ./wavs --sr 24000
-  python m4a_to_wav.py a.m4a b.m4a -o ./out
+  python scripts/m4a_to_wav.py recording.m4a
+  python scripts/m4a_to_wav.py ./input_dir -o ./wavs --sr 24000
+  python scripts/m4a_to_wav.py a.m4a b.m4a -o ./out
 """
 
 from __future__ import annotations

@@ -15,7 +15,7 @@ Deps:
   # optional: torch with CUDA for faster Whisper
 
 Example:
-  python prepare_wav_for_training.py long_recording.wav \\
+  python scripts/prepare_wav_for_training.py long_recording.wav \\
     --out_dataset ./BimpeTTS_Dataset \\
     --out_lists ./Data \\
     --whisper_model small
@@ -247,7 +247,7 @@ def main():
 
     if args.skip_lists:
         print("Skipping train/val lists (--skip_lists).")
-        print("Next: python prepare_bimpe_data.py --metadata ... --wavs ...")
+        print("Next: python scripts/prepare_bimpe_data.py --metadata ... --wavs ...")
         return
 
     ood_path = _ensure_ood(args.repo_ood, str(args.out_lists))

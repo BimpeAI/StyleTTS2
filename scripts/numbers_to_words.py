@@ -9,9 +9,9 @@ Requires:
   pip install num2words
 
 Usage:
-  python3 numbers_to_words.py "Send me $10,000 or call 1234567"
-  python3 numbers_to_words.py -f input.txt -o output.txt
-  echo "Balance is $1,250.50" | python3 numbers_to_words.py
+  python3 scripts/numbers_to_words.py "Send me $10,000 or call 1234567"
+  python3 scripts/numbers_to_words.py -f input.txt -o output.txt
+  echo "Balance is $1,250.50" | python3 scripts/numbers_to_words.py
 """
 
 from __future__ import annotations

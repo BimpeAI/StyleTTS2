@@ -1,7 +1,7 @@
 # Continue finetune on a NEW speaker only (prioritize her voice).
 # Starts from Models/BimpeTTS_ft/best_2nd.pth — do NOT reload LibriTTS.
 # Do NOT mix Bimpe training data; Bimpe identity will weaken by design.
-# Prep data first — see NEW_SPEAKER_FINETUNE.md
+# Prep data first — see docs/NEW_SPEAKER_FINETUNE.md
 
 log_dir: "Models/BimpeTTS_ft_new"
 save_freq: 10 # checkpoint / early-stop decision every N epochs

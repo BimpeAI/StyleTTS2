@@ -7,8 +7,8 @@ Output format (required by StyleTTS2):
 NOT absolute paths, NOT plain English text.
 
 Example:
-  python datasplit.py
-  python datasplit.py --no_phonemize   # debug only; do not train on this
+  python scripts/datasplit.py
+  python scripts/datasplit.py --no_phonemize   # debug only; do not train on this
 """
 
 from __future__ import annotations

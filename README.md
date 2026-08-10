@@ -27,6 +27,19 @@ This repository is **StyleTTS 2** upstream, plus a **BimpeTTS** finetune path us
 
 For a new speaker with limited data, prefer **LibriTTS finetune** over training from scratch.
 
+### Repository layout
+
+| Location | Contents |
+|----------|----------|
+| Repo root | Upstream StyleTTS2 core (`models.py`, `meldataset.py`, `train_*.py`, …) |
+| [Configs/](Configs/) | Training / finetune YAML (incl. `config_bimpe_*.yml`) |
+| [Modules/](Modules/), [Utils/](Utils/) | Model modules and ASR / JDC / PLBERT utilities |
+| [Demo/](Demo/), [Colab/](Colab/) | Notebooks and conversation demos |
+| [serving/](serving/) | FastAPI TTS HTTP server |
+| [scripts/](scripts/) | Bimpe data-prep and audio helpers (see [scripts/README.md](scripts/README.md)) |
+| [docs/](docs/) | Fork guides (e.g. [docs/NEW_SPEAKER_FINETUNE.md](docs/NEW_SPEAKER_FINETUNE.md)) |
+| `Models/`, `Data/`, `voices/` | Checkpoints, lists, and style refs (local; often gitignored) |
+
 ---
 
 ## Requirements
@@ -136,11 +149,11 @@ Transcript lists must be IPA phonemes:
 filename.wav|ipa_phonemes|speaker_id
 ```
 
-Helpers:
+Helpers (run from repo root; see [scripts/README.md](scripts/README.md)):
 
-- [datasplit.py](datasplit.py)
-- [prepare_bimpe_data.py](prepare_bimpe_data.py)
-- [prepare_wav_for_training.py](prepare_wav_for_training.py) — long WAV → wavs + metadata + IPA lists
+- [scripts/datasplit.py](scripts/datasplit.py)
+- [scripts/prepare_bimpe_data.py](scripts/prepare_bimpe_data.py)
+- [scripts/prepare_wav_for_training.py](scripts/prepare_wav_for_training.py) — long WAV → wavs + metadata + IPA lists
 
 Typical remote paths used by the Bimpe configs:
 
@@ -155,7 +168,7 @@ Adjust paths in [Configs/config_bimpe_ft.yml](Configs/config_bimpe_ft.yml) if yo
 ### 2) Download LibriTTS pretrained checkpoint
 
 ```bash
-bash download_libritts_pretrained.sh
+bash scripts/download_libritts_pretrained.sh
 # → Models/LibriTTS/epochs_2nd_00020.pth
 ```
 
@@ -177,9 +190,9 @@ Architecture in the Bimpe configs stays **multispeaker + HiFi-GAN** so it matche
 
 ### 3b) Specialize on a new speaker (continue finetune)
 
-To prioritize a **new** speaker’s voice (and accept that Bimpe will weaken), follow **[NEW_SPEAKER_FINETUNE.md](NEW_SPEAKER_FINETUNE.md)**. Summary:
+To prioritize a **new** speaker’s voice (and accept that Bimpe will weaken), follow **[docs/NEW_SPEAKER_FINETUNE.md](docs/NEW_SPEAKER_FINETUNE.md)**. Summary:
 
-1. `prepare_wav_for_training.py` → new `wavs/` + `metadata.csv` + IPA lists (`speaker_id=0`)
+1. `scripts/prepare_wav_for_training.py` → new `wavs/` + `metadata.csv` + IPA lists (`speaker_id=0`)
 2. Continue from best Bimpe weights on **only** that data (no Bimpe merge):
 
 ```bash

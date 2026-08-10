@@ -2,10 +2,10 @@
 """Trim N-minute samples from the start of a WAV.
 
 Usage:
-  python3 trim_audio_samples.py input.wav --minutes 5
-  python3 trim_audio_samples.py input.wav --minutes 5 10
-  python3 trim_audio_samples.py input.wav -m 3 7 15 -o /path/to/outdir
-  python3 trim_audio_samples.py input.wav -m 5 --start-sec 120
+  python3 scripts/trim_audio_samples.py input.wav --minutes 5
+  python3 scripts/trim_audio_samples.py input.wav --minutes 5 10
+  python3 scripts/trim_audio_samples.py input.wav -m 3 7 15 -o /path/to/outdir
+  python3 scripts/trim_audio_samples.py input.wav -m 5 --start-sec 120
 """
 
 from __future__ import annotations

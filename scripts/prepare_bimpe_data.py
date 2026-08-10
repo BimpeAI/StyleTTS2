@@ -7,7 +7,7 @@ Creates phonemized train/val lists in the format:
 Also ensures OOD_texts.txt exists for the DataLoader (required every sample).
 
 Example (on the VPS):
-  python prepare_bimpe_data.py \\
+  python scripts/prepare_bimpe_data.py \\
     --metadata /root/BimpeTTS_Dataset/metadata.csv \\
     --wavs /root/BimpeTTS_Dataset/wavs \\
     --out_dir /root/Data \\

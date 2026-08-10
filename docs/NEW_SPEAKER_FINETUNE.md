@@ -19,7 +19,7 @@ Confirm:
 ## Phase 1 — Build `wavs/` + `metadata.csv`
 
 ```bash
-python prepare_wav_for_training.py /path/to/new_female_26min.wav \
+python scripts/prepare_wav_for_training.py /path/to/new_female_26min.wav \
   --out_dataset /root/NewSpeaker_Dataset \
   --out_lists /root/NewSpeaker_Data \
   --prefix female2 \
@@ -43,7 +43,7 @@ python prepare_wav_for_training.py /path/to/new_female_26min.wav \
 **Quality gate:** Spot-check ~20 `metadata.csv` rows vs audio. After fixing Whisper errors:
 
 ```bash
-python prepare_bimpe_data.py \
+python scripts/prepare_bimpe_data.py \
   --metadata /root/NewSpeaker_Dataset/metadata.csv \
   --wavs /root/NewSpeaker_Dataset/wavs \
   --out_dir /root/NewSpeaker_Data \
@@ -56,7 +56,7 @@ Aim for roughly **80–150+** clips from 26 minutes.
 
 ## Phase 2 — Continue finetune (new speaker only)
 
-Config: [Configs/config_bimpe_ft_new_speaker.yml](Configs/config_bimpe_ft_new_speaker.yml)
+Config: [Configs/config_bimpe_ft_new_speaker.yml](../Configs/config_bimpe_ft_new_speaker.yml)
 
 - Starts from `Models/BimpeTTS_ft/best_2nd.pth`
 - Writes to `Models/BimpeTTS_ft_new/` (old Bimpe best stays safe)
