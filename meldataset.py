@@ -93,10 +93,25 @@ class FilePathDataset(torch.utils.data.Dataset):
         self.max_mel_length = 192
         
         self.min_length = min_length
+        if not osp.isfile(OOD_data):
+            raise FileNotFoundError(
+                f"OOD_data not found: {OOD_data}. "
+                "Provide Data/OOD_texts.txt (format: text|anything or wav|text|spk)."
+            )
         with open(OOD_data, 'r', encoding='utf-8') as f:
             tl = f.readlines()
+        if not tl:
+            raise ValueError(f"OOD_data is empty: {OOD_data}")
         idx = 1 if '.wav' in tl[0].split('|')[0] else 0
-        self.ptexts = [t.split('|')[idx] for t in tl]
+        self.ptexts = [t.split('|')[idx].strip() for t in tl if t.strip()]
+        # Avoid infinite sampling loop when all OOD lines are shorter than min_length
+        long_enough = [t for t in self.ptexts if len(t) >= self.min_length]
+        if not long_enough:
+            raise ValueError(
+                f"No OOD lines in {OOD_data} with length >= min_length={self.min_length}. "
+                "Use longer phonemized texts or lower data_params.min_length."
+            )
+        self.ptexts = long_enough
         
         self.root_path = root_path
 
@@ -119,19 +134,13 @@ class FilePathDataset(torch.utils.data.Dataset):
         ref_data = (self.df[self.df[2] == str(speaker_id)]).sample(n=1).iloc[0].tolist()
         ref_mel_tensor, ref_label = self._load_data(ref_data[:3])
         
-        # get OOD text
-        
-        ps = ""
-        
-        while len(ps) < self.min_length:
-            rand_idx = np.random.randint(0, len(self.ptexts) - 1)
-            ps = self.ptexts[rand_idx]
-            
-            text = self.text_cleaner(ps)
-            text.insert(0, 0)
-            text.append(0)
-
-            ref_text = torch.LongTensor(text)
+        # get OOD text (ptexts already filtered to len >= min_length)
+        rand_idx = np.random.randint(0, len(self.ptexts))
+        ps = self.ptexts[rand_idx]
+        text = self.text_cleaner(ps)
+        text.insert(0, 0)
+        text.append(0)
+        ref_text = torch.LongTensor(text)
         
         return speaker_id, acoustic_feature, text_tensor, ref_text, ref_mel_tensor, ref_label, path, wave
 
@@ -143,7 +152,7 @@ class FilePathDataset(torch.utils.data.Dataset):
             wave = wave[:, 0].squeeze()
         if sr != 24000:
             wave = librosa.resample(wave, orig_sr=sr, target_sr=24000)
-            print(wave_path, sr)
+            #print(wave_path, sr)
             
         wave = np.concatenate([np.zeros([5000]), wave, np.zeros([5000])], axis=0)
         

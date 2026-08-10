@@ -1,0 +1,520 @@
+"""
+FastAPI TTS server for StyleTTS2 with multi-voice reference cache.
+
+Run from StyleTTS2 repo root:
+  export CONFIG_PATH=Configs/config_bimpe_ft.yml
+  export CHECKPOINT_PATH=Models/BimpeTTS_ft/best_2nd.pth
+  export VOICES_DIR=/path/to/voices          # pure-name *.wav (skips *_sample)
+  export STYLETTS_DEFAULT_VOICE=tara
+  # optional fallback if VOICES_DIR missing tara.wav:
+  # export REF_WAV=/path/to/tara.wav
+  export STYLETTS_MAX_CONCURRENT=1
+  uvicorn serving.tts_server:app --host 0.0.0.0 --port 8000
+"""
+
+from __future__ import annotations
+
+import asyncio
+import glob
+import io
+import os
+import re
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
+
+import librosa
+import numpy as np
+import torch
+import torchaudio
+import yaml
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from nltk.tokenize import word_tokenize
+from pydantic import BaseModel, Field
+
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from models import *  # noqa: E402,F401,F403
+from utils import *  # noqa: E402,F401,F403
+from text_utils import TextCleaner  # noqa: E402
+from Modules.diffusion.sampler import (  # noqa: E402
+    ADPM2Sampler,
+    DiffusionSampler,
+    KarrasSchedule,
+)
+
+SR = 24000
+MEAN, STD = -4, 4
+
+to_mel = torchaudio.transforms.MelSpectrogram(
+    n_mels=80, n_fft=2048, win_length=1200, hop_length=300
+)
+textcleaner = TextCleaner()
+
+
+class TTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Text to synthesize")
+    voice: Optional[str] = Field(
+        None, description="Voice id = pure wav stem (e.g. tara). Skips *_sample names."
+    )
+    alpha: float = 0.3
+    beta: float = 0.7
+    diffusion_steps: int = 5
+    embedding_scale: float = 1.0
+    pause_ms: int = 120
+    speed: float = Field(1.0, gt=0, description="Speaking rate via duration scaling (>1 faster)")
+
+
+class AppState:
+    def __init__(self):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.config = None
+        self.model = None
+        self.model_params = None
+        self.sampler = None
+        self.phonemizer = None
+        self.ref_s = None  # default style
+        self.styles: dict[str, torch.Tensor] = {}
+        self.voices_dir: Optional[str] = None
+        self.default_voice: str = "tara"
+        self.checkpoint_path = None
+        self.ref_wav = None
+        self.synth_semaphore: Optional[asyncio.Semaphore] = None
+
+
+state = AppState()
+
+
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    return os.environ.get(name, default)
+
+
+def _is_sample_voice(stem: str) -> bool:
+    return stem.endswith("_sample")
+
+
+def find_latest_checkpoint(log_dir: str) -> str:
+    best = os.path.join(log_dir, "best_2nd.pth")
+    if os.path.isfile(best):
+        return best
+    paths = sorted(glob.glob(os.path.join(log_dir, "epoch_2nd_*.pth")))
+    if not paths:
+        raise FileNotFoundError(f"No best_2nd.pth or epoch_2nd_*.pth under {log_dir}")
+    return paths[-1]
+
+
+def length_to_mask(lengths: torch.Tensor) -> torch.Tensor:
+    mask = torch.arange(lengths.max()).unsqueeze(0).expand(lengths.shape[0], -1).type_as(lengths)
+    return torch.gt(mask + 1, lengths.unsqueeze(1))
+
+
+def preprocess(wave: np.ndarray) -> torch.Tensor:
+    wave_tensor = torch.from_numpy(wave).float()
+    mel_tensor = to_mel(wave_tensor)
+    return (torch.log(1e-5 + mel_tensor.unsqueeze(0)) - MEAN) / STD
+
+
+def load_checkpoint_weights(model, path: str):
+    params_whole = torch.load(path, map_location="cpu")
+    params = params_whole["net"]
+    for key in model:
+        if key not in params:
+            continue
+        state_dict = params[key]
+        try:
+            model[key].load_state_dict(state_dict, strict=True)
+        except Exception:
+            new_state_dict = OrderedDict()
+            if next(iter(state_dict)).startswith("module."):
+                for k, v in state_dict.items():
+                    new_state_dict[k[7:] if k.startswith("module.") else k] = v
+            else:
+                new_state_dict = state_dict
+            model[key].load_state_dict(new_state_dict, strict=False)
+    _ = [model[key].eval() for key in model]
+    return params_whole.get("epoch"), params_whole.get("val_loss")
+
+
+def compute_style(path: str) -> torch.Tensor:
+    wave, sr = librosa.load(path, sr=24000)
+    audio, _ = librosa.effects.trim(wave, top_db=30)
+    if audio.size < SR // 10:
+        audio = wave
+    mel_tensor = preprocess(audio.astype(np.float32)).to(state.device)
+    with torch.no_grad():
+        ref_s = state.model.style_encoder(mel_tensor.unsqueeze(1))
+        ref_p = state.model.predictor_encoder(mel_tensor.unsqueeze(1))
+    return torch.cat([ref_s, ref_p], dim=1)
+
+
+def list_voice_wavs(voices_dir: str) -> list[tuple[str, Path]]:
+    root = Path(voices_dir)
+    if not root.is_dir():
+        return []
+    out: list[tuple[str, Path]] = []
+    for path in sorted(root.glob("*.wav")):
+        stem = path.stem
+        if _is_sample_voice(stem):
+            continue
+        out.append((stem, path))
+    return out
+
+
+def resolve_ref_s(voice: Optional[str]) -> tuple[str, torch.Tensor]:
+    default = state.default_voice
+    name = (voice or default or "").strip()
+    if not name:
+        name = default
+    if _is_sample_voice(name):
+        raise ValueError(
+            f"voice '{name}' is a *_sample name and is not allowed; "
+            f"available: {sorted(state.styles)}"
+        )
+    if name in state.styles:
+        return name, state.styles[name]
+    if state.ref_s is not None and (not name or name == default):
+        return default or "default", state.ref_s
+    raise ValueError(
+        f"Unknown voice '{name}'. Available: {sorted(state.styles)}"
+    )
+
+
+def split_sentences(text: str):
+    text = text.strip().replace('"', "")
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if p[-1] not in ".!?":
+            p += "."
+        out.append(p)
+    return out
+
+
+def synthesize_sentence(
+    text: str,
+    ref_s: torch.Tensor,
+    s_prev=None,
+    alpha: float = 0.3,
+    beta: float = 0.7,
+    t: float = 0.7,
+    diffusion_steps: int = 5,
+    embedding_scale: float = 1.0,
+    speed: float = 1.0,
+    max_tokens: int = 500,
+):
+    text = text.strip().replace('"', "")
+    ps = state.phonemizer.phonemize([text])
+    ps = word_tokenize(ps[0])
+    ps = " ".join(ps).replace("``", '"').replace("''", '"')
+
+    tokens = textcleaner(ps)
+    tokens.insert(0, 0)
+    if len(tokens) > max_tokens:
+        raise ValueError(f"Sentence too long ({len(tokens)} tokens): {text[:80]}...")
+    if speed <= 0:
+        raise ValueError(f"speed must be > 0, got {speed}")
+
+    tokens = torch.LongTensor(tokens).to(state.device).unsqueeze(0)
+    model = state.model
+    model_params = state.model_params
+
+    with torch.no_grad():
+        input_lengths = torch.LongTensor([tokens.shape[-1]]).to(state.device)
+        text_mask = length_to_mask(input_lengths).to(state.device)
+
+        t_en = model.text_encoder(tokens, input_lengths, text_mask)
+        bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
+        d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+
+        s_pred = state.sampler(
+            noise=torch.randn((1, 256)).unsqueeze(1).to(state.device),
+            embedding=bert_dur,
+            embedding_scale=embedding_scale,
+            features=ref_s,
+            num_steps=diffusion_steps,
+        ).squeeze(1)
+
+        if s_prev is not None:
+            s_pred = t * s_prev + (1 - t) * s_pred
+
+        s = s_pred[:, 128:]
+        ref = s_pred[:, :128]
+        ref = alpha * ref + (1 - alpha) * ref_s[:, :128]
+        s = beta * s + (1 - beta) * ref_s[:, 128:]
+        s_pred = torch.cat([ref, s], dim=-1)
+
+        d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+        x, _ = model.predictor.lstm(d)
+        duration = torch.sigmoid(model.predictor.duration_proj(x)).sum(axis=-1)
+        pred_dur = torch.round(duration.squeeze() / speed).clamp(min=1)
+
+        pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().item()))
+        c_frame = 0
+        for i in range(pred_aln_trg.size(0)):
+            pred_aln_trg[i, c_frame : c_frame + int(pred_dur[i].item())] = 1
+            c_frame += int(pred_dur[i].item())
+
+        en = d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(state.device)
+        if model_params.decoder.type == "hifigan":
+            asr_new = torch.zeros_like(en)
+            asr_new[:, :, 0] = en[:, :, 0]
+            asr_new[:, :, 1:] = en[:, :, 0:-1]
+            en = asr_new
+
+        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+
+        asr = t_en @ pred_aln_trg.unsqueeze(0).to(state.device)
+        if model_params.decoder.type == "hifigan":
+            asr_new = torch.zeros_like(asr)
+            asr_new[:, :, 0] = asr[:, :, 0]
+            asr_new[:, :, 1:] = asr[:, :, 0:-1]
+            asr = asr_new
+
+        out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+
+    return out.squeeze().cpu().numpy()[..., :-50], s_pred
+
+
+def synthesize_text(
+    text: str,
+    ref_s: torch.Tensor,
+    alpha: float = 0.3,
+    beta: float = 0.7,
+    diffusion_steps: int = 5,
+    embedding_scale: float = 1.0,
+    pause_ms: int = 120,
+    speed: float = 1.0,
+) -> np.ndarray:
+    sentences = split_sentences(text)
+    if not sentences:
+        raise ValueError("No sentences found in text")
+
+    wavs = []
+    s_prev = None
+    silence = np.zeros(int(SR * pause_ms / 1000.0), dtype=np.float32)
+    for i, sent in enumerate(sentences):
+        wav, s_prev = synthesize_sentence(
+            sent,
+            ref_s,
+            s_prev=s_prev,
+            alpha=alpha,
+            beta=beta,
+            diffusion_steps=diffusion_steps,
+            embedding_scale=embedding_scale,
+            speed=speed,
+        )
+        wavs.append(wav.astype(np.float32))
+        if i < len(sentences) - 1:
+            wavs.append(silence)
+    return np.concatenate(wavs)
+
+
+def audio_to_wav_bytes(audio: np.ndarray, sr: int = SR) -> bytes:
+    audio = np.asarray(audio, dtype=np.float32)
+    peak = np.max(np.abs(audio)) + 1e-8
+    if peak > 1.0:
+        audio = audio / peak
+    buf = io.BytesIO()
+    torchaudio.save(buf, torch.from_numpy(audio).unsqueeze(0), sr, format="wav")
+    return buf.getvalue()
+
+
+def _load_voice_styles(voices_dir: Optional[str]) -> None:
+    state.styles = {}
+    state.voices_dir = voices_dir
+    if not voices_dir:
+        return
+    pairs = list_voice_wavs(voices_dir)
+    if not pairs:
+        print(f"VOICES_DIR={voices_dir}: no pure-name .wav files (skipped *_sample)", flush=True)
+        return
+    for stem, path in pairs:
+        try:
+            state.styles[stem] = compute_style(str(path))
+            print(f"  voice loaded: {stem} <- {path}", flush=True)
+        except Exception as e:
+            print(f"  voice FAILED: {stem} ({path}): {e}", flush=True)
+
+
+def load_runtime():
+    config_path = _env("CONFIG_PATH", "Configs/config_bimpe_ft.yml")
+    voices_dir = _env("VOICES_DIR") or _env("STYLETTS_VOICES_DIR")
+    default_voice = (_env("STYLETTS_DEFAULT_VOICE", "tara") or "tara").strip()
+    ref_wav = _env("REF_WAV")
+    log_dir_default = "Models/BimpeTTS_ft"
+
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"CONFIG_PATH not found: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    ckpt = _env("CHECKPOINT_PATH")
+    if not ckpt:
+        ckpt = find_latest_checkpoint(config.get("log_dir", log_dir_default))
+    if not os.path.isfile(ckpt):
+        raise FileNotFoundError(f"CHECKPOINT_PATH not found: {ckpt}")
+
+    import nltk
+    import phonemizer
+    from Utils.PLBERT.util import load_plbert
+
+    for pkg in ("punkt", "punkt_tab"):
+        try:
+            nltk.data.find(f"tokenizers/{pkg}")
+        except LookupError:
+            nltk.download(pkg, quiet=True)
+
+    device = state.device
+    text_aligner = load_ASR_models(config.get("ASR_path"), config.get("ASR_config"))
+    pitch_extractor = load_F0_models(config.get("F0_path"))
+    plbert = load_plbert(config.get("PLBERT_dir"))
+
+    model_params = recursive_munch(config["model_params"])
+    model = build_model(model_params, text_aligner, pitch_extractor, plbert)
+    _ = [model[key].eval() for key in model]
+    _ = [model[key].to(device) for key in model]
+
+    epoch, val_loss = load_checkpoint_weights(model, ckpt)
+    sampler = DiffusionSampler(
+        model.diffusion.diffusion,
+        sampler=ADPM2Sampler(),
+        sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0),
+        clamp=False,
+    )
+
+    state.config = config
+    state.model = model
+    state.model_params = model_params
+    state.sampler = sampler
+    state.phonemizer = phonemizer.backend.EspeakBackend(
+        language="en-us", preserve_punctuation=True, with_stress=True
+    )
+    state.checkpoint_path = ckpt
+    state.default_voice = default_voice
+
+    _load_voice_styles(voices_dir)
+
+    # Default style: preferred voice from VOICES_DIR, else REF_WAV
+    if default_voice in state.styles:
+        state.ref_s = state.styles[default_voice]
+        state.ref_wav = str(Path(voices_dir) / f"{default_voice}.wav") if voices_dir else default_voice
+    elif ref_wav and os.path.isfile(ref_wav):
+        state.ref_s = compute_style(ref_wav)
+        state.ref_wav = ref_wav
+        # Register under default name if missing
+        if default_voice and default_voice not in state.styles and not _is_sample_voice(default_voice):
+            state.styles[default_voice] = state.ref_s
+    elif state.styles:
+        # Fall back to first loaded voice
+        first = sorted(state.styles)[0]
+        state.default_voice = first
+        state.ref_s = state.styles[first]
+        state.ref_wav = str(Path(voices_dir) / f"{first}.wav") if voices_dir else first
+        print(f"Default voice '{default_voice}' missing; using '{first}'", flush=True)
+    else:
+        raise FileNotFoundError(
+            "No voice styles loaded. Set VOICES_DIR to a folder of pure-name .wav files "
+            f"(e.g. tara.wav) and/or set REF_WAV. Default voice was '{default_voice}'."
+        )
+
+    max_c = max(1, int(_env("STYLETTS_MAX_CONCURRENT", "1") or "1"))
+    state.synth_semaphore = asyncio.Semaphore(max_c)
+
+    print(
+        f"TTS ready | device={device} | ckpt={ckpt} | epoch={epoch} "
+        f"| val_loss={val_loss} | default_voice={state.default_voice} "
+        f"| voices={sorted(state.styles)} | max_concurrent={max_c}",
+        flush=True,
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_runtime()
+    yield
+
+
+app = FastAPI(title="BimpeTTS StyleTTS2 Server", lifespan=lifespan)
+
+
+@app.get("/health")
+def health():
+    ready = state.model is not None and state.ref_s is not None
+    return {
+        "status": "ok" if ready else "loading",
+        "device": state.device,
+        "checkpoint": state.checkpoint_path,
+        "ref_wav": state.ref_wav,
+        "default_voice": state.default_voice,
+        "voices_loaded": sorted(state.styles.keys()),
+        "voices_dir": state.voices_dir,
+    }
+
+
+@app.get("/voices")
+def voices():
+    return {
+        "voices": sorted(state.styles.keys()),
+        "default": state.default_voice,
+    }
+
+
+@app.post("/tts")
+async def tts(req: TTSRequest):
+    if state.model is None or state.ref_s is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    try:
+        voice_name, ref_s = resolve_ref_s(req.voice)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    sem = state.synth_semaphore or asyncio.Semaphore(1)
+
+    def _run():
+        return synthesize_text(
+            req.text,
+            ref_s,
+            alpha=req.alpha,
+            beta=req.beta,
+            diffusion_steps=req.diffusion_steps,
+            embedding_scale=req.embedding_scale,
+            pause_ms=req.pause_ms,
+            speed=req.speed,
+        )
+
+    try:
+        async with sem:
+            audio = await asyncio.to_thread(_run)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS failed: {e}") from e
+
+    wav_bytes = audio_to_wav_bytes(audio)
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"X-StyleTTS-Voice": voice_name},
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "serving.tts_server:app",
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        reload=False,
+    )

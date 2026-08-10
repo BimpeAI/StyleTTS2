@@ -1,0 +1,33 @@
+# Python deps for Demo/Inference_LJSpeech.ipynb + serving/tts_server.py
+# Install from StyleTTS2 repo root:
+#   pip install -r requirements_ljspeech.txt
+#
+# System packages (Debian/Ubuntu/Docker):
+#   apt-get install -y espeak-ng espeak-ng-data libespeak-ng1 build-essential
+#
+# PyTorch: install a matching torch/torchaudio build for your CUDA first, e.g.:
+#   pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu124
+# then install this file. Pins below assume torch 2.4.x.
+
+numpy==1.26.4
+scipy==1.11.4
+transformers==4.51.3
+librosa==0.10.1
+SoundFile
+munch
+pydub
+PyYAML
+nltk
+matplotlib
+accelerate
+einops
+einops-exts
+tqdm
+typing-extensions
+phonemizer
+ipython
+jupyter
+fastapi
+uvicorn[standard]
+# Prefer Resemble AI fork (exports mask_from_lens). Do NOT use plain PyPI monotonic_align.
+git+https://github.com/resemble-ai/monotonic_align.git

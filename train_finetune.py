@@ -67,9 +67,12 @@ def main(config_path):
     batch_size = config.get('batch_size', 10)
 
     epochs = config.get('epochs', 200)
-    save_freq = config.get('save_freq', 2)
+    save_freq = int(config.get('save_freq', 10))
     log_interval = config.get('log_interval', 10)
-    saving_epoch = config.get('save_freq', 2)
+    saving_epoch = save_freq
+    early_stopping_patience = int(config.get('early_stopping_patience', 2))
+    early_stopping_min_delta = float(config.get('early_stopping_min_delta', 0.0))
+    metrics_csv = osp.join(log_dir, 'metrics_ft.csv')
 
     data_params = config.get('data_params', None)
     sr = config['preprocess_params'].get('sr', 24000)
@@ -80,6 +83,7 @@ def main(config_path):
     OOD_data = data_params['OOD_data']
 
     max_len = config.get('max_len', 200)
+    num_workers = int(config.get('num_workers', 0))
     
     loss_params = Munch(config['loss_params'])
     diff_epoch = loss_params.diff_epoch
@@ -95,7 +99,7 @@ def main(config_path):
                                         OOD_data=OOD_data,
                                         min_length=min_length,
                                         batch_size=batch_size,
-                                        num_workers=2,
+                                        num_workers=num_workers,
                                         dataset_config={},
                                         device=device)
 
@@ -128,10 +132,13 @@ def main(config_path):
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
     _ = [model[key].to(device) for key in model]
     
-    # DP
-    for key in model:
-        if key != "mpd" and key != "msd" and key != "wd":
-            model[key] = MyDataParallel(model[key])
+    n_gpus = torch.cuda.device_count()
+    use_dp = n_gpus > 1
+    print(f"GPUs available: {n_gpus}; DataParallel={'ON' if use_dp else 'OFF'}", flush=True)
+    if use_dp:
+        for key in model:
+            if key != "mpd" and key != "msd" and key != "wd":
+                model[key] = MyDataParallel(model[key])
             
     start_epoch = 0
     iters = 0
@@ -164,9 +171,13 @@ def main(config_path):
                    sr, 
                    model_params.slm.sr).to(device)
 
-    gl = MyDataParallel(gl)
-    dl = MyDataParallel(dl)
-    wl = MyDataParallel(wl)
+    if use_dp:
+        gl = MyDataParallel(gl)
+        dl = MyDataParallel(dl)
+        wl = MyDataParallel(wl)
+
+    def raw(m):
+        return m.module if use_dp else m
     
     sampler = DiffusionSampler(
         model.diffusion.diffusion,
@@ -214,6 +225,8 @@ def main(config_path):
     n_down = model.text_aligner.n_down
 
     best_loss = float('inf')  # best test loss
+    best_epoch = -1
+    patience = 0
     loss_train_record = list([])
     loss_test_record = list([])
     iters = 0
@@ -243,6 +256,21 @@ def main(config_path):
     for epoch in range(start_epoch, epochs):
         running_loss = 0
         start_time = time.time()
+        epoch_mel = 0.0
+        epoch_gen = 0.0
+        epoch_d = 0.0
+        epoch_ce = 0.0
+        epoch_dur = 0.0
+        epoch_slm = 0.0
+        epoch_norm = 0.0
+        epoch_F0 = 0.0
+        epoch_sty = 0.0
+        epoch_diff = 0.0
+        epoch_d_slm = 0.0
+        epoch_gen_slm = 0.0
+        epoch_mono = 0.0
+        epoch_s2s = 0.0
+        epoch_steps = 0
 
         _ = [model[key].eval() for key in model]
         
@@ -316,8 +344,8 @@ def main(config_path):
                 num_steps = np.random.randint(3, 5)
                 
                 if model_params.diffusion.dist.estimate_sigma_data:
-                    model.diffusion.module.diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
-                    running_std.append(model.diffusion.module.diffusion.sigma_data)
+                    raw(model.diffusion).diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
+                    running_std.append(raw(model.diffusion).diffusion.sigma_data)
                     
                 if multispeaker:
                     s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
@@ -334,7 +362,7 @@ def main(config_path):
                           embedding_scale=1,
                              embedding_mask_proba=0.1,
                              num_steps=num_steps).squeeze(1)                    
-                    loss_diff = model.diffusion.module.diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
+                    loss_diff = raw(model.diffusion).diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
                     loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
             else:
                 loss_sty = 0
@@ -539,6 +567,27 @@ def main(config_path):
                         d_loss_slm.backward(retain_graph=True)
                         optimizer.step('wd')
 
+            def _s(x):
+                if isinstance(x, torch.Tensor):
+                    return float(x.detach().mean().item()) if not (torch.isnan(x).any() or torch.isinf(x).any()) else 0.0
+                return float(x) if x else 0.0
+
+            epoch_mel += _s(loss_mel)
+            epoch_gen += _s(loss_gen_all)
+            epoch_d += _s(d_loss)
+            epoch_ce += _s(loss_ce)
+            epoch_dur += _s(loss_dur)
+            epoch_slm += _s(loss_lm)
+            epoch_norm += _s(loss_norm_rec)
+            epoch_F0 += _s(loss_F0_rec)
+            epoch_sty += _s(loss_sty)
+            epoch_diff += _s(loss_diff)
+            epoch_d_slm += _s(d_loss_slm)
+            epoch_gen_slm += _s(loss_gen_lm)
+            epoch_mono += _s(loss_mono)
+            epoch_s2s += _s(loss_s2s)
+            epoch_steps += 1
+
             iters = iters + 1
             
             if (i+1)%log_interval == 0:
@@ -674,34 +723,133 @@ def main(config_path):
                     continue
 
         print('Epochs:', epoch + 1)
-        logger.info('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test) + '\n\n\n')
+        early_stop = False
+        denom = max(1, epoch_steps)
+
+        if iters_test == 0:
+            print('Validation skipped (no valid batches)', flush=True)
+            append_epoch_metrics(metrics_csv, {
+                'epoch': epoch + 1,
+                'train_mel': f'{epoch_mel / denom:.6f}',
+                'val_mel': '',
+                'val_dur': '',
+                'val_f0': '',
+                'train_gen': f'{epoch_gen / denom:.6f}',
+                'train_d': f'{epoch_d / denom:.6f}',
+                'train_ce': f'{epoch_ce / denom:.6f}',
+                'train_dur': f'{epoch_dur / denom:.6f}',
+                'train_slm': f'{epoch_slm / denom:.6f}',
+                'train_norm': f'{epoch_norm / denom:.6f}',
+                'train_F0': f'{epoch_F0 / denom:.6f}',
+                'train_sty': f'{epoch_sty / denom:.6f}',
+                'train_diff': f'{epoch_diff / denom:.6f}',
+                'train_d_slm': f'{epoch_d_slm / denom:.6f}',
+                'train_gen_slm': f'{epoch_gen_slm / denom:.6f}',
+                'train_mono': f'{epoch_mono / denom:.6f}',
+                'train_s2s': f'{epoch_s2s / denom:.6f}',
+                'best_val': f'{best_loss:.6f}' if best_loss != float('inf') else '',
+                'best_epoch': best_epoch if best_epoch >= 0 else '',
+                'patience': patience,
+            })
+            continue
+
+        val_mel = loss_test / iters_test
+        val_dur = loss_align / iters_test
+        val_f0 = loss_f / iters_test
+        if isinstance(val_mel, torch.Tensor):
+            val_mel = float(val_mel.item())
+        if isinstance(val_dur, torch.Tensor):
+            val_dur = float(val_dur.item())
+        if isinstance(val_f0, torch.Tensor):
+            val_f0 = float(val_f0.item())
+
+        logger.info('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (val_mel, val_dur, val_f0) + '\n\n\n')
         print('\n\n\n')
-        writer.add_scalar('eval/mel_loss', loss_test / iters_test, epoch + 1)
-        writer.add_scalar('eval/dur_loss', loss_test / iters_test, epoch + 1)
-        writer.add_scalar('eval/F0_loss', loss_f / iters_test, epoch + 1)
-        
-        
-        if (epoch + 1) % save_freq == 0 :
-            if (loss_test / iters_test) < best_loss:
-                best_loss = loss_test / iters_test
-            print('Saving..')
-            state = {
-                'net':  {key: model[key].state_dict() for key in model}, 
-                'optimizer': optimizer.state_dict(),
-                'iters': iters,
-                'val_loss': loss_test / iters_test,
-                'epoch': epoch,
-            }
-            save_path = osp.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
-            torch.save(state, save_path)
+        writer.add_scalar('eval/mel_loss', val_mel, epoch + 1)
+        writer.add_scalar('eval/dur_loss', val_dur, epoch + 1)
+        writer.add_scalar('eval/F0_loss', val_f0, epoch + 1)
 
-            # if estimate sigma, save the estimated simga
-            if model_params.diffusion.dist.estimate_sigma_data:
-                config['model_params']['diffusion']['dist']['sigma_data'] = float(np.mean(running_std))
+        # Checkpoint / early-stop on save_freq cadence (epochs 10, 20, ...)
+        if (epoch + 1) % saving_epoch == 0:
+            if is_improved(val_mel, best_loss, early_stopping_min_delta):
+                best_loss = val_mel
+                best_epoch = epoch + 1
+                patience = 0
+                print('New best checkpoint — saving...', flush=True)
+                state = {
+                    'net': {key: model[key].state_dict() for key in model},
+                    'optimizer': optimizer.state_dict(),
+                    'iters': iters,
+                    'val_loss': val_mel,
+                    'epoch': epoch,
+                }
+                save_best_checkpoint(
+                    log_dir,
+                    state,
+                    epoch_prefix='2nd',
+                    epoch=epoch + 1,
+                    best_name='best_2nd.pth',
+                )
+                if model_params.diffusion.dist.estimate_sigma_data and running_std:
+                    config['model_params']['diffusion']['dist']['sigma_data'] = float(np.mean(running_std))
+                    with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
+                        yaml.dump(config, outfile, default_flow_style=True)
+            else:
+                patience += 1
+                print(
+                    f'No val improvement at epoch {epoch + 1} '
+                    f'(best={best_loss:.3f} @ epoch {best_epoch}). '
+                    f'patience={patience}/{early_stopping_patience}',
+                    flush=True,
+                )
+                if patience >= early_stopping_patience:
+                    early_stop = True
+                    print(
+                        f'Early stopping: no val improvement for '
+                        f'{early_stopping_patience} intervals.',
+                        flush=True,
+                    )
 
-                with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
-                    yaml.dump(config, outfile, default_flow_style=True)
+            print(
+                f'Eval @ epoch {epoch + 1} | val={val_mel:.3f} | '
+                f'best={best_loss:.3f} @ epoch {best_epoch} | '
+                f'patience={patience}/{early_stopping_patience}',
+                flush=True,
+            )
 
-                            
-if __name__=="__main__":
+        append_epoch_metrics(metrics_csv, {
+            'epoch': epoch + 1,
+            'train_mel': f'{epoch_mel / denom:.6f}',
+            'val_mel': f'{val_mel:.6f}',
+            'val_dur': f'{val_dur:.6f}',
+            'val_f0': f'{val_f0:.6f}',
+            'train_gen': f'{epoch_gen / denom:.6f}',
+            'train_d': f'{epoch_d / denom:.6f}',
+            'train_ce': f'{epoch_ce / denom:.6f}',
+            'train_dur': f'{epoch_dur / denom:.6f}',
+            'train_slm': f'{epoch_slm / denom:.6f}',
+            'train_norm': f'{epoch_norm / denom:.6f}',
+            'train_F0': f'{epoch_F0 / denom:.6f}',
+            'train_sty': f'{epoch_sty / denom:.6f}',
+            'train_diff': f'{epoch_diff / denom:.6f}',
+            'train_d_slm': f'{epoch_d_slm / denom:.6f}',
+            'train_gen_slm': f'{epoch_gen_slm / denom:.6f}',
+            'train_mono': f'{epoch_mono / denom:.6f}',
+            'train_s2s': f'{epoch_s2s / denom:.6f}',
+            'best_val': f'{best_loss:.6f}' if best_loss != float('inf') else '',
+            'best_epoch': best_epoch if best_epoch >= 0 else '',
+            'patience': patience,
+        })
+
+        if early_stop:
+            break
+
+    print(
+        f'Finetune done. Best val={best_loss:.3f} @ epoch {best_epoch}. '
+        f'Checkpoint: {osp.join(log_dir, "best_2nd.pth")}',
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
     main()

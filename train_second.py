@@ -68,9 +68,12 @@ def main(config_path):
     batch_size = config.get('batch_size', 10)
 
     epochs = config.get('epochs_2nd', 200)
-    save_freq = config.get('save_freq', 2)
+    save_freq = int(config.get('save_freq', 10))
     log_interval = config.get('log_interval', 10)
-    saving_epoch = config.get('save_freq', 2)
+    saving_epoch = save_freq
+    early_stopping_patience = int(config.get('early_stopping_patience', 2))
+    early_stopping_min_delta = float(config.get('early_stopping_min_delta', 0.0))
+    metrics_csv = osp.join(log_dir, 'metrics_2nd.csv')
 
     data_params = config.get('data_params', None)
     sr = config['preprocess_params'].get('sr', 24000)
@@ -81,6 +84,7 @@ def main(config_path):
     OOD_data = data_params['OOD_data']
 
     max_len = config.get('max_len', 200)
+    num_workers = int(config.get('num_workers', 0))
     
     loss_params = Munch(config['loss_params'])
     diff_epoch = loss_params.diff_epoch
@@ -96,7 +100,7 @@ def main(config_path):
                                         OOD_data=OOD_data,
                                         min_length=min_length,
                                         batch_size=batch_size,
-                                        num_workers=2,
+                                        num_workers=num_workers,
                                         dataset_config={},
                                         device=device)
 
@@ -128,11 +132,16 @@ def main(config_path):
     multispeaker = model_params.multispeaker
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
     _ = [model[key].to(device) for key in model]
-    
-    # DP
-    for key in model:
-        if key != "mpd" and key != "msd" and key != "wd":
-            model[key] = MyDataParallel(model[key])
+
+    # DataParallel on a single GPU still wraps params as `module.*`, which
+    # silently breaks stage-1 Accelerate checkpoints. Only use DP for multi-GPU.
+    n_gpus = torch.cuda.device_count()
+    use_dp = n_gpus > 1
+    print(f"GPUs available: {n_gpus}; DataParallel={'ON' if use_dp else 'OFF'}", flush=True)
+    if use_dp:
+        for key in model:
+            if key != "mpd" and key != "msd" and key != "wd":
+                model[key] = MyDataParallel(model[key])
             
     start_epoch = 0
     iters = 0
@@ -155,6 +164,10 @@ def main(config_path):
             epochs += start_epoch
             
             model.predictor_encoder = copy.deepcopy(model.style_encoder)
+            # Sanity: style encoder weights should not look freshly random
+            with torch.no_grad():
+                w = next(model.style_encoder.parameters())
+                print(f"style_encoder weight |mean|={w.detach().float().abs().mean().item():.6f}", flush=True)
         else:
             raise ValueError('You need to specify the path to the first stage model.') 
 
@@ -165,9 +178,14 @@ def main(config_path):
                    sr, 
                    model_params.slm.sr).to(device)
 
-    gl = MyDataParallel(gl)
-    dl = MyDataParallel(dl)
-    wl = MyDataParallel(wl)
+    if use_dp:
+        gl = MyDataParallel(gl)
+        dl = MyDataParallel(dl)
+        wl = MyDataParallel(wl)
+
+    def raw(m):
+        """Unwrap DataParallel when active."""
+        return m.module if use_dp else m
     
     sampler = DiffusionSampler(
         model.diffusion.diffusion,
@@ -215,6 +233,8 @@ def main(config_path):
     n_down = model.text_aligner.n_down
 
     best_loss = float('inf')  # best test loss
+    best_epoch = -1
+    patience = 0
     loss_train_record = list([])
     loss_test_record = list([])
     iters = 0
@@ -244,6 +264,19 @@ def main(config_path):
     for epoch in range(start_epoch, epochs):
         running_loss = 0
         start_time = time.time()
+        epoch_mel = 0.0
+        epoch_gen = 0.0
+        epoch_d = 0.0
+        epoch_ce = 0.0
+        epoch_dur = 0.0
+        epoch_slm = 0.0
+        epoch_norm = 0.0
+        epoch_F0 = 0.0
+        epoch_sty = 0.0
+        epoch_diff = 0.0
+        epoch_d_slm = 0.0
+        epoch_gen_slm = 0.0
+        epoch_steps = 0
 
         _ = [model[key].eval() for key in model]
 
@@ -302,8 +335,12 @@ def main(config_path):
                 s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
                 gs.append(s)
 
-            s_dur = torch.stack(ss).squeeze()  # global prosodic styles
-            gs = torch.stack(gs).squeeze() # global acoustic styles
+            s_dur = torch.stack(ss).squeeze(1)  # global prosodic styles [B, style_dim]
+            gs = torch.stack(gs).squeeze(1) # global acoustic styles [B, style_dim]
+            if s_dur.ndim == 1:
+                s_dur = s_dur.unsqueeze(0)
+            if gs.ndim == 1:
+                gs = gs.unsqueeze(0)
             s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
 
             bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
@@ -314,8 +351,8 @@ def main(config_path):
                 num_steps = np.random.randint(3, 5)
                 
                 if model_params.diffusion.dist.estimate_sigma_data:
-                    model.diffusion.module.diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
-                    running_std.append(model.diffusion.module.diffusion.sigma_data)
+                    raw(model.diffusion).diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
+                    running_std.append(raw(model.diffusion).diffusion.sigma_data)
                     
                 if multispeaker:
                     s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device), 
@@ -332,7 +369,7 @@ def main(config_path):
                           embedding_scale=1,
                              embedding_mask_proba=0.1,
                              num_steps=num_steps).squeeze(1)                    
-                    loss_diff = model.diffusion.module.diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
+                    loss_diff = raw(model.diffusion).diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
                     loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
             else:
                 loss_sty = 0
@@ -345,6 +382,8 @@ def main(config_path):
             
             mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
             mel_len_st = int(mel_input_length.min().item() / 2 - 1)
+            if mel_len < 1 or mel_len_st < 1 or int(mel_input_length.min().item() / 2) <= mel_len:
+                continue
             en = []
             gt = []
             st = []
@@ -363,7 +402,7 @@ def main(config_path):
                 wav.append(torch.from_numpy(y).to(device))
 
                 # style reference (better to be different from the GT)
-                random_start = np.random.randint(0, mel_length - mel_len_st)
+                random_start = np.random.randint(0, max(1, mel_length - mel_len_st))
                 st.append(mels[bib, :, (random_start * 2):((random_start+mel_len_st) * 2)])
                 
             wav = torch.stack(wav).float().detach()
@@ -386,6 +425,8 @@ def main(config_path):
                 asr_real = model.text_aligner.get_feature(gt)
 
                 N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
+                N_real = torch.nan_to_num(N_real, nan=0.0, posinf=10.0, neginf=-10.0)
+                F0_real = torch.nan_to_num(F0_real, nan=0.0, posinf=0.0, neginf=0.0)
                 
                 y_rec_gt = wav.unsqueeze(1)
                 y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
@@ -398,8 +439,15 @@ def main(config_path):
                     wav = y_rec_gt_pred # use reconstruction since decoder is fixed
 
             F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
+            # Fresh predictor heads can explode and NaN the ISTFT decoder
+            F0_fake = torch.nan_to_num(F0_fake, nan=0.0, posinf=0.0, neginf=0.0)
+            N_fake = torch.nan_to_num(N_fake, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-20, 20)
 
             y_rec = model.decoder(en, F0_fake, N_fake, s)
+            if torch.isnan(y_rec).any() or torch.isinf(y_rec).any():
+                print('Warning: decoder produced NaN/Inf. Skipping batch.', flush=True)
+                optimizer.zero_grad()
+                continue
 
             loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
             loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
@@ -450,11 +498,13 @@ def main(config_path):
                      loss_params.lambda_sty * loss_sty + \
                      loss_params.lambda_diff * loss_diff
 
-            running_loss += loss_mel.item()
+            running_loss += loss_mel.item() if not torch.isnan(loss_mel) else 0.0
+            if torch.isnan(g_loss) or torch.isinf(g_loss):
+                print('Warning: Generator loss is NaN/Inf. Skipping backward pass for this batch.', flush=True)
+                optimizer.zero_grad()
+                continue
+
             g_loss.backward()
-            if torch.isnan(g_loss):
-                from IPython.core.debugger import set_trace
-                set_trace()
 
             optimizer.step('bert_encoder')
             optimizer.step('bert')
@@ -537,6 +587,25 @@ def main(config_path):
 
             else:
                 d_loss_slm, loss_gen_lm = 0, 0
+
+            def _s(x):
+                if isinstance(x, torch.Tensor):
+                    return float(x.detach().mean().item()) if not (torch.isnan(x).any() or torch.isinf(x).any()) else 0.0
+                return float(x) if x else 0.0
+
+            epoch_mel += _s(loss_mel)
+            epoch_gen += _s(loss_gen_all)
+            epoch_d += _s(d_loss)
+            epoch_ce += _s(loss_ce)
+            epoch_dur += _s(loss_dur)
+            epoch_slm += _s(loss_lm)
+            epoch_norm += _s(loss_norm_rec)
+            epoch_F0 += _s(loss_F0_rec)
+            epoch_sty += _s(loss_sty)
+            epoch_diff += _s(loss_diff)
+            epoch_d_slm += _s(d_loss_slm)
+            epoch_gen_slm += _s(loss_gen_lm)
+            epoch_steps += 1
                 
             iters = iters + 1
             
@@ -676,11 +745,47 @@ def main(config_path):
                     continue
 
         print('Epochs:', epoch + 1)
-        logger.info('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test) + '\n\n\n')
+        early_stop = False
+        if iters_test == 0:
+            print('Validation skipped (no valid batches)', flush=True)
+            denom = max(1, epoch_steps)
+            append_epoch_metrics(metrics_csv, {
+                'epoch': epoch + 1,
+                'train_mel': f'{epoch_mel / denom:.6f}',
+                'val_mel': '',
+                'val_dur': '',
+                'val_f0': '',
+                'train_gen': f'{epoch_gen / denom:.6f}',
+                'train_d': f'{epoch_d / denom:.6f}',
+                'train_ce': f'{epoch_ce / denom:.6f}',
+                'train_dur': f'{epoch_dur / denom:.6f}',
+                'train_slm': f'{epoch_slm / denom:.6f}',
+                'train_norm': f'{epoch_norm / denom:.6f}',
+                'train_F0': f'{epoch_F0 / denom:.6f}',
+                'train_sty': f'{epoch_sty / denom:.6f}',
+                'train_diff': f'{epoch_diff / denom:.6f}',
+                'train_d_slm': f'{epoch_d_slm / denom:.6f}',
+                'train_gen_slm': f'{epoch_gen_slm / denom:.6f}',
+                'best_val': f'{best_loss:.6f}' if best_loss != float('inf') else '',
+                'best_epoch': best_epoch if best_epoch >= 0 else '',
+                'patience': patience,
+            })
+            continue
+        val_mel = (loss_test / iters_test)
+        # loss_test may be a tensor
+        if isinstance(val_mel, torch.Tensor):
+            val_mel = float(val_mel.item())
+        val_dur = (loss_align / iters_test)
+        if isinstance(val_dur, torch.Tensor):
+            val_dur = float(val_dur.item())
+        val_f0 = (loss_f / iters_test)
+        if isinstance(val_f0, torch.Tensor):
+            val_f0 = float(val_f0.item())
+        logger.info('Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f' % (val_mel, val_dur, val_f0) + '\n\n\n')
         print('\n\n\n')
-        writer.add_scalar('eval/mel_loss', loss_test / iters_test, epoch + 1)
-        writer.add_scalar('eval/dur_loss', loss_align / iters_test, epoch + 1)
-        writer.add_scalar('eval/F0_loss', loss_f / iters_test, epoch + 1)
+        writer.add_scalar('eval/mel_loss', val_mel, epoch + 1)
+        writer.add_scalar('eval/dur_loss', val_dur, epoch + 1)
+        writer.add_scalar('eval/F0_loss', val_f0, epoch + 1)
         
         if epoch < joint_epoch:
             # generating reconstruction examples with GT duration
@@ -710,7 +815,12 @@ def main(config_path):
                     writer.add_audio('pred/y' + str(bib), y_pred.cpu().numpy().squeeze(), epoch, sample_rate=sr)
 
                     if epoch == 0:
-                        writer.add_audio('gt/y' + str(bib), waves[bib].squeeze(), epoch, sample_rate=sr)
+                        gt_wave = waves[bib]
+                        if isinstance(gt_wave, np.ndarray):
+                            gt_audio = np.clip(gt_wave.squeeze(), -1.0, 1.0)
+                        else:
+                            gt_audio = torch.clamp(gt_wave.squeeze(), min=-1.0, max=1.0).detach().cpu().numpy()
+                        writer.add_audio('gt/y' + str(bib), gt_audio, epoch, sample_rate=sr)
 
                     if bib >= 5:
                         break
@@ -767,26 +877,86 @@ def main(config_path):
                     if bib >= 5:
                         break
                             
-        if epoch % saving_epoch == 0:
-            if (loss_test / iters_test) < best_loss:
-                best_loss = loss_test / iters_test
-            print('Saving..')
-            state = {
-                'net':  {key: model[key].state_dict() for key in model}, 
-                'optimizer': optimizer.state_dict(),
-                'iters': iters,
-                'val_loss': loss_test / iters_test,
-                'epoch': epoch,
-            }
-            save_path = osp.join(log_dir, 'epoch_2nd_%05d.pth' % epoch)
-            torch.save(state, save_path)
-            
-            # if estimate sigma, save the estimated simga
-            if model_params.diffusion.dist.estimate_sigma_data:
-                config['model_params']['diffusion']['dist']['sigma_data'] = float(np.mean(running_std))
-                
-                with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
-                    yaml.dump(config, outfile, default_flow_style=True)
+        denom = max(1, epoch_steps)
+        # Checkpoint / early-stop on save_freq cadence (epochs 10, 20, ...)
+        if (epoch + 1) % saving_epoch == 0:
+            if is_improved(val_mel, best_loss, early_stopping_min_delta):
+                best_loss = val_mel
+                best_epoch = epoch + 1
+                patience = 0
+                print('New best checkpoint — saving...', flush=True)
+                state = {
+                    'net': {key: model[key].state_dict() for key in model},
+                    'optimizer': optimizer.state_dict(),
+                    'iters': iters,
+                    'val_loss': val_mel,
+                    'epoch': epoch,
+                }
+                save_best_checkpoint(
+                    log_dir,
+                    state,
+                    epoch_prefix='2nd',
+                    epoch=epoch + 1,
+                    best_name='best_2nd.pth',
+                )
+                if model_params.diffusion.dist.estimate_sigma_data and running_std:
+                    config['model_params']['diffusion']['dist']['sigma_data'] = float(np.mean(running_std))
+                    with open(osp.join(log_dir, osp.basename(config_path)), 'w') as outfile:
+                        yaml.dump(config, outfile, default_flow_style=True)
+            else:
+                patience += 1
+                print(
+                    f'No val improvement at epoch {epoch + 1} '
+                    f'(best={best_loss:.3f} @ epoch {best_epoch}). '
+                    f'patience={patience}/{early_stopping_patience}',
+                    flush=True,
+                )
+                if patience >= early_stopping_patience:
+                    early_stop = True
+                    print(
+                        f'Early stopping: no val improvement for '
+                        f'{early_stopping_patience} intervals.',
+                        flush=True,
+                    )
+
+            print(
+                f'Eval @ epoch {epoch + 1} | val={val_mel:.3f} | '
+                f'best={best_loss:.3f} @ epoch {best_epoch} | '
+                f'patience={patience}/{early_stopping_patience}',
+                flush=True,
+            )
+
+        append_epoch_metrics(metrics_csv, {
+            'epoch': epoch + 1,
+            'train_mel': f'{epoch_mel / denom:.6f}',
+            'val_mel': f'{val_mel:.6f}',
+            'val_dur': f'{val_dur:.6f}',
+            'val_f0': f'{val_f0:.6f}',
+            'train_gen': f'{epoch_gen / denom:.6f}',
+            'train_d': f'{epoch_d / denom:.6f}',
+            'train_ce': f'{epoch_ce / denom:.6f}',
+            'train_dur': f'{epoch_dur / denom:.6f}',
+            'train_slm': f'{epoch_slm / denom:.6f}',
+            'train_norm': f'{epoch_norm / denom:.6f}',
+            'train_F0': f'{epoch_F0 / denom:.6f}',
+            'train_sty': f'{epoch_sty / denom:.6f}',
+            'train_diff': f'{epoch_diff / denom:.6f}',
+            'train_d_slm': f'{epoch_d_slm / denom:.6f}',
+            'train_gen_slm': f'{epoch_gen_slm / denom:.6f}',
+            'best_val': f'{best_loss:.6f}' if best_loss != float('inf') else '',
+            'best_epoch': best_epoch if best_epoch >= 0 else '',
+            'patience': patience,
+        })
+
+        if early_stop:
+            break
+
+    print(
+        f'Stage 2 done. Best val={best_loss:.3f} @ epoch {best_epoch}. '
+        f'Checkpoint: {osp.join(log_dir, "best_2nd.pth")}',
+        flush=True,
+    )
+
         
 if __name__=="__main__":
     main()

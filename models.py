@@ -699,7 +699,56 @@ def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_module
     for key in model:
         if key in params and key not in ignore_modules:
             print('%s loaded' % key)
-            model[key].load_state_dict(params[key], strict=False)
+            state_dict = params[key]
+            model_dict = model[key].state_dict()
+            # Remap DataParallel `module.` prefix mismatches (stage1 accelerate
+            # unwrap vs stage2 MyDataParallel). strict=False alone silently skips
+            # all weights and causes immediate NaN in stage 2.
+            try:
+                model[key].load_state_dict(state_dict, strict=True)
+                print(f'  {key}: strict load OK ({len(model_dict)} tensors)')
+            except RuntimeError:
+                from collections import OrderedDict
+                new_state_dict = OrderedDict()
+                sample_model_key = next(iter(model_dict.keys()))
+                sample_ckpt_key = next(iter(state_dict.keys()))
+                model_has_module = sample_model_key.startswith('module.')
+                ckpt_has_module = sample_ckpt_key.startswith('module.')
+                print(
+                    f'  {key}: remapping keys (model module.={model_has_module}, '
+                    f'ckpt module.={ckpt_has_module})',
+                    flush=True,
+                )
+
+                if model_has_module and not ckpt_has_module:
+                    for k, v in state_dict.items():
+                        new_state_dict['module.' + k] = v
+                elif ckpt_has_module and not model_has_module:
+                    for k, v in state_dict.items():
+                        new_state_dict[k[len('module.'):] if k.startswith('module.') else k] = v
+                else:
+                    # Match by exact name after normalizing module. prefix
+                    ckpt_norm = {
+                        (k[len('module.'):] if k.startswith('module.') else k): v
+                        for k, v in state_dict.items()
+                    }
+                    for k_m in model_dict.keys():
+                        k_norm = k_m[len('module.'):] if k_m.startswith('module.') else k_m
+                        if k_norm in ckpt_norm:
+                            new_state_dict[k_m] = ckpt_norm[k_norm]
+
+                load_result = model[key].load_state_dict(new_state_dict, strict=False)
+                # PyTorch <1.8 returns None
+                if load_result is None:
+                    print(f'  remapped {key}: loaded via compatible PyTorch (strict=False)')
+                else:
+                    missing, unexpected = load_result
+                    if missing:
+                        print(f'  warning: {key} missing keys: {len(missing)} (e.g. {missing[:3]})')
+                    if unexpected:
+                        print(f'  warning: {key} unexpected keys: {len(unexpected)} (e.g. {unexpected[:3]})')
+                    loaded = len(model_dict) - len(missing)
+                    print(f'  remapped {key}: loaded {loaded}/{len(model_dict)} params')
     _ = [model[key].eval() for key in model]
     
     if not load_only_params:
