@@ -86,9 +86,17 @@ class AppState:
         self.checkpoint_path = None
         self.ref_wav = None
         self.synth_semaphore: Optional[asyncio.Semaphore] = None
+        self.max_concurrent: int = 1
+        self.in_flight: int = 0
 
 
 state = AppState()
+
+MAX_TOKENS = max(64, int(os.environ.get("STYLETTS_MAX_TOKENS", "500") or "500"))
+STYLE_BLEND_T = float(os.environ.get("STYLETTS_STYLE_BLEND_T", "0.7") or "0.7")
+CROSSFADE_MS = int(os.environ.get("STYLETTS_CROSSFADE_MS", "40") or "40")
+TRIM_TAIL_MS = int(os.environ.get("STYLETTS_TRIM_TAIL_MS", "8") or "8")
+TRIM_HEAD_MS = int(os.environ.get("STYLETTS_TRIM_HEAD_MS", "4") or "4")
 
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -199,6 +207,87 @@ def split_sentences(text: str):
     return out
 
 
+def phoneme_token_len(text: str) -> int:
+    ps = state.phonemizer.phonemize([text.strip()])
+    ps = " ".join(word_tokenize(ps[0]))
+    tokens = textcleaner(ps)
+    return len(tokens) + 1  # leading 0 token in synthesize_sentence
+
+
+def split_long_sentence(sentence: str, max_tokens: int = MAX_TOKENS) -> list[str]:
+    words = sentence.split()
+    chunks, buf = [], []
+    for w in words:
+        trial = " ".join(buf + [w])
+        if buf and phoneme_token_len(trial) > max_tokens:
+            piece = " ".join(buf)
+            if piece[-1] not in ".!?":
+                piece += "."
+            chunks.append(piece)
+            buf = [w]
+        else:
+            buf.append(w)
+    if buf:
+        piece = " ".join(buf)
+        if piece[-1] not in ".!?":
+            piece += "."
+        chunks.append(piece)
+    return chunks
+
+
+def chunk_by_tokens(text: str, max_tokens: int = MAX_TOKENS) -> list[str]:
+    """Pack sentences until the next would exceed max_tokens phoneme tokens."""
+    chunks, buf = [], ""
+    for sent in split_sentences(text):
+        pieces = (
+            split_long_sentence(sent, max_tokens)
+            if phoneme_token_len(sent) > max_tokens
+            else [sent]
+        )
+        for piece in pieces:
+            trial = (buf + " " + piece).strip() if buf else piece
+            if buf and phoneme_token_len(trial) > max_tokens:
+                chunks.append(buf)
+                buf = piece
+            else:
+                buf = trial
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def trim_pulse(
+    w: np.ndarray,
+    tail_ms: int = TRIM_TAIL_MS,
+    head_ms: int = TRIM_HEAD_MS,
+    sr: int = SR,
+) -> np.ndarray:
+    """Drop StyleTTS decoder end-click and a bit of leading noise."""
+    w = np.asarray(w, dtype=np.float32).reshape(-1)
+    n_tail = int(sr * tail_ms / 1000)
+    n_head = int(sr * head_ms / 1000)
+    if w.size <= n_tail + n_head + 1:
+        return w
+    return w[n_head:-n_tail]
+
+
+def crossfade(
+    a: np.ndarray,
+    b: np.ndarray,
+    fade_ms: int = CROSSFADE_MS,
+    sr: int = SR,
+) -> np.ndarray:
+    """Overlap-add with cosine fade (no inserted silence)."""
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
+    b = np.asarray(b, dtype=np.float32).reshape(-1)
+    n = min(int(sr * fade_ms / 1000), len(a) // 4, len(b) // 4)
+    if n < 8:
+        return np.concatenate([a, b])
+    fade_out = 0.5 * (1.0 + np.cos(np.linspace(0, np.pi, n, dtype=np.float32)))
+    fade_in = fade_out[::-1]
+    return np.concatenate([a[:-n], a[-n:] * fade_out + b[:n] * fade_in, b[n:]])
+
+
 def synthesize_sentence(
     text: str,
     ref_s: torch.Tensor,
@@ -291,31 +380,35 @@ def synthesize_text(
     beta: float = 0.7,
     diffusion_steps: int = 5,
     embedding_scale: float = 1.0,
-    pause_ms: int = 120,
+    pause_ms: int = 120,  # kept for API compat; ignored (crossfade used instead)
     speed: float = 1.0,
+    max_tokens: int = MAX_TOKENS,
 ) -> np.ndarray:
-    sentences = split_sentences(text)
-    if not sentences:
+    """Synthesize with token-budget chunks, s_prev continuity, trim + crossfade joins."""
+    del pause_ms  # noqa: F841 — callers may still send it
+    chunks = chunk_by_tokens(text, max_tokens=max_tokens)
+    if not chunks:
         raise ValueError("No sentences found in text")
 
-    wavs = []
+    wav_out: Optional[np.ndarray] = None
     s_prev = None
-    silence = np.zeros(int(SR * pause_ms / 1000.0), dtype=np.float32)
-    for i, sent in enumerate(sentences):
+    for chunk in chunks:
         wav, s_prev = synthesize_sentence(
-            sent,
+            chunk,
             ref_s,
             s_prev=s_prev,
             alpha=alpha,
             beta=beta,
+            t=STYLE_BLEND_T,
             diffusion_steps=diffusion_steps,
             embedding_scale=embedding_scale,
             speed=speed,
+            max_tokens=max_tokens,
         )
-        wavs.append(wav.astype(np.float32))
-        if i < len(sentences) - 1:
-            wavs.append(silence)
-    return np.concatenate(wavs)
+        wav = trim_pulse(wav.astype(np.float32))
+        wav_out = wav if wav_out is None else crossfade(wav_out, wav)
+    assert wav_out is not None
+    return wav_out
 
 
 def audio_to_wav_bytes(audio: np.ndarray, sr: int = SR) -> bytes:
@@ -428,12 +521,15 @@ def load_runtime():
         )
 
     max_c = max(1, int(_env("STYLETTS_MAX_CONCURRENT", "1") or "1"))
+    state.max_concurrent = max_c
+    state.in_flight = 0
     state.synth_semaphore = asyncio.Semaphore(max_c)
 
     print(
         f"TTS ready | device={device} | ckpt={ckpt} | epoch={epoch} "
         f"| val_loss={val_loss} | default_voice={state.default_voice} "
-        f"| voices={sorted(state.styles)} | max_concurrent={max_c}",
+        f"| voices={sorted(state.styles)} | max_concurrent={max_c} "
+        f"| max_tokens={MAX_TOKENS} | crossfade_ms={CROSSFADE_MS}",
         flush=True,
     )
 
@@ -452,12 +548,15 @@ def health():
     ready = state.model is not None and state.ref_s is not None
     return {
         "status": "ok" if ready else "loading",
+        "ready": ready,
         "device": state.device,
         "checkpoint": state.checkpoint_path,
         "ref_wav": state.ref_wav,
         "default_voice": state.default_voice,
         "voices_loaded": sorted(state.styles.keys()),
         "voices_dir": state.voices_dir,
+        "in_flight": state.in_flight,
+        "max_concurrent": state.max_concurrent,
     }
 
 
@@ -493,9 +592,23 @@ async def tts(req: TTSRequest):
             speed=req.speed,
         )
 
+    import time as _time
+
+    queue_wait_started = _time.perf_counter()
     try:
         async with sem:
-            audio = await asyncio.to_thread(_run)
+            waited = _time.perf_counter() - queue_wait_started
+            if waited > 0.05:
+                print(
+                    f"[tts] queue wait {waited:.2f}s voice={voice_name} "
+                    f"in_flight={state.in_flight}/{state.max_concurrent}",
+                    flush=True,
+                )
+            state.in_flight += 1
+            try:
+                audio = await asyncio.to_thread(_run)
+            finally:
+                state.in_flight = max(0, state.in_flight - 1)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
