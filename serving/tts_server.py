@@ -63,12 +63,12 @@ class TTSRequest(BaseModel):
     voice: Optional[str] = Field(
         None, description="Voice id = pure wav stem (e.g. tara). Skips *_sample names."
     )
-    alpha: float = 0.3
-    beta: float = 0.7
-    diffusion_steps: int = 5
+    alpha: float = 0.0
+    beta: float = 0.2
+    diffusion_steps: int = 3
     embedding_scale: float = 1.0
     pause_ms: int = 120
-    speed: float = Field(1.0, gt=0, description="Speaking rate via duration scaling (>1 faster)")
+    speed: float = Field(1.3, gt=0, description="Speaking rate via duration scaling (>1 faster)")
 
 
 class AppState:
@@ -292,12 +292,12 @@ def synthesize_sentence(
     text: str,
     ref_s: torch.Tensor,
     s_prev=None,
-    alpha: float = 0.3,
-    beta: float = 0.7,
+    alpha: float = 0.0,
+    beta: float = 0.2,
     t: float = 0.7,
-    diffusion_steps: int = 5,
+    diffusion_steps: int = 3,
     embedding_scale: float = 1.0,
-    speed: float = 1.0,
+    speed: float = 1.3,
     max_tokens: int = 500,
 ):
     text = text.strip().replace('"', "")
@@ -376,12 +376,12 @@ def synthesize_sentence(
 def synthesize_text(
     text: str,
     ref_s: torch.Tensor,
-    alpha: float = 0.3,
-    beta: float = 0.7,
-    diffusion_steps: int = 5,
+    alpha: float = 0.0,
+    beta: float = 0.2,
+    diffusion_steps: int = 3,
     embedding_scale: float = 1.0,
     pause_ms: int = 120,  # kept for API compat; ignored (crossfade used instead)
-    speed: float = 1.0,
+    speed: float = 1.3,
     max_tokens: int = MAX_TOKENS,
 ) -> np.ndarray:
     """Synthesize with token-budget chunks, s_prev continuity, trim + crossfade joins."""

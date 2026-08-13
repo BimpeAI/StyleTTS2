@@ -15,11 +15,12 @@ export STYLETTS_MAX_CONCURRENT=1    # raise only after measuring VRAM; scale via
 uvicorn serving.tts_server:app --host 0.0.0.0 --port 8000
 ```
 
-Voice wav stems must match frontend IDs: `tara`, `femi`, `bayo`, `james`, `tobi` (lowercase; skip `*_sample`).
+Voice wav stems must match frontend IDs (lowercase; skip `*_sample`):
+`agnes`, `bayo`, `bretheny`, `eli`, `femi`, `freda`, `james`, `kara`, `sarah`, `tara`, `temi`, `tobi`.
 
-Compatible reference set (copy or point `VOICES_DIR` at these pure-name files):
+Compatible reference set — point `VOICES_DIR` at:
 
-`bimpe-ai-onprem-realtime-STT/services/tts/voices/{tara,femi,bayo,james,tobi}.wav`
+`bimpe-ai-onprem-realtime-STT/services/tts/voices/`
 
 ## API
 
