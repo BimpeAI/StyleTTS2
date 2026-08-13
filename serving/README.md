@@ -1,6 +1,6 @@
 # StyleTTS2 HTTP TTS server
 
-Always-on FastAPI process for LiveKit agents (and curl smoke tests).
+Always-on FastAPI process for LiveKit agents. Optimized for **TTFA &lt; 200ms** on short first phrases (warm CUDA, non-queued).
 
 ## Run (GPU host)
 
@@ -8,52 +8,58 @@ Always-on FastAPI process for LiveKit agents (and curl smoke tests).
 cd /path/to/StyleTTS2-1
 export CONFIG_PATH=Configs/config_bimpe_ft.yml
 export CHECKPOINT_PATH=Models/BimpeTTS_ft/best_2nd.pth
-export VOICES_DIR=/path/to/voices   # tara.wav, james.wav, femi.wav, …
+export VOICES_DIR=/path/to/voices
 export STYLETTS_DEFAULT_VOICE=tara
-export STYLETTS_MAX_CONCURRENT=1    # raise only after measuring VRAM; scale via replicas
+export STYLETTS_MAX_CONCURRENT=1
+export STYLETTS_REQUIRE_CUDA=1
+export STYLETTS_FP16=1
+# export STYLETTS_TORCH_COMPILE=1   # optional, after validating quality
 
 uvicorn serving.tts_server:app --host 0.0.0.0 --port 8000
 ```
 
-Voice wav stems must match frontend IDs (lowercase; skip `*_sample`):
-`agnes`, `bayo`, `bretheny`, `eli`, `femi`, `freda`, `james`, `kara`, `sarah`, `tara`, `temi`, `tobi`.
+Voice stems (lowercase; skip `*_sample`):  
+`agnes`, `bayo`, `bretheny`, `eli`, `femi`, `freda`, `james`, `kara`, `sarah`, `tara`, `temi`, `tobi`  
+— point `VOICES_DIR` at `bimpe-ai-onprem-realtime-STT/services/tts/voices/`.
 
-Compatible reference set — point `VOICES_DIR` at:
-
-`bimpe-ai-onprem-realtime-STT/services/tts/voices/`
+Defaults: `diffusion_steps=2`, `speed=1.4`, `alpha=0.0`, `beta=0.2`. Startup runs a short warmup synth.
 
 ## API
 
 | Method | Path | Notes |
 |--------|------|--------|
-| GET | `/health` | `ready`, `voices_loaded`, `in_flight`, `max_concurrent` |
+| GET | `/health` | `ready`, `device`, `fp16`, `warmed_up`, `voices_loaded`, `in_flight`, `synth_ms_p50` / `p95` |
 | GET | `/voices` | list + default |
-| POST | `/tts` | JSON `{text, voice?, alpha?, beta?, diffusion_steps?, speed?}` → `audio/wav` @ 24 kHz |
+| POST | `/tts` | JSON → `audio/wav` @ 24 kHz (smoke / fallback) |
+| POST | `/tts/stream` | JSON → chunked raw **s16le** mono 24 kHz (agents; low TTFA) |
 
-Synthesis uses phoneme-token chunks (≤500), style continuity (`s_prev`), trim + crossfade between chunks.
+Body: `{text, voice?, alpha?, beta?, diffusion_steps?, speed?}`.
+
+## Latency SLA
+
+- **In scope:** first PCM bytes for a short phrase (`"Hi there."`) with `device=cuda`, warmed model, `queue_wait≈0`.
+- **Out of scope:** finishing long paragraphs in &lt;200ms; multi-room queue wait.
 
 ## Concurrency
 
-One process holds one GPU model. Default `STYLETTS_MAX_CONCURRENT=1` queues overlapping requests. For more LiveKit rooms, run **horizontal replicas** (separate GPUs / processes) behind a load balancer — do not set concurrent=10 on a single card.
+Default `STYLETTS_MAX_CONCURRENT=1`. Scale with **replicas**, not a high concurrent setting on one GPU.
 
 ## Agents
 
-Point bimpe-agents at this service:
-
 ```bash
-export STYLETTS_URL=http://<gpu-host>:8000
-python agent.py dev
+export STYLETTS_URL=http://127.0.0.1:8000   # same host preferred
+python agent.py start
 ```
 
-See also bimpe-agents `STYLETTS.md`.
+See bimpe-agents `STYLETTS.md`.
 
 ## Smoke
 
 ```bash
 curl -s "$STYLETTS_URL/health"
-curl -s "$STYLETTS_URL/voices"
 curl -s -X POST "$STYLETTS_URL/tts" -H 'Content-Type: application/json' \
-  -d '{"text":"Hello from StyleTTS.","voice":"tara"}' -o /tmp/styletts_smoke.wav
+  -d '{"text":"Hi there.","voice":"tara"}' -o /tmp/styletts_smoke.wav
+curl -s -X POST "$STYLETTS_URL/tts/stream" -H 'Content-Type: application/json' \
+  -d '{"text":"Hi there.","voice":"tara"}' -o /tmp/styletts.pcm
+# Server log should show ttfa_ms=… ; /health synth_ms_p50 after a few calls
 ```
-
-Then one LiveKit room from the frontend; then 2–4 rooms and watch `in_flight` vs OOM. Keep `STYLETTS_MAX_CONCURRENT` at 1–2 on a single GPU unless you measured VRAM.

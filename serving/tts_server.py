@@ -1,14 +1,17 @@
 """
 FastAPI TTS server for StyleTTS2 with multi-voice reference cache.
 
+Latency-focused defaults: CUDA + FP16, diffusion_steps=2, speed=1.4, startup warmup,
+POST /tts/stream (raw s16le) for low TTFA.
+
 Run from StyleTTS2 repo root:
   export CONFIG_PATH=Configs/config_bimpe_ft.yml
   export CHECKPOINT_PATH=Models/BimpeTTS_ft/best_2nd.pth
-  export VOICES_DIR=/path/to/voices          # pure-name *.wav (skips *_sample)
+  export VOICES_DIR=/path/to/voices
   export STYLETTS_DEFAULT_VOICE=tara
-  # optional fallback if VOICES_DIR missing tara.wav:
-  # export REF_WAV=/path/to/tara.wav
   export STYLETTS_MAX_CONCURRENT=1
+  export STYLETTS_REQUIRE_CUDA=1
+  export STYLETTS_FP16=1
   uvicorn serving.tts_server:app --host 0.0.0.0 --port 8000
 """
 
@@ -19,10 +22,11 @@ import glob
 import io
 import os
 import re
-from collections import OrderedDict
-from contextlib import asynccontextmanager
+import time
+from collections import OrderedDict, deque
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Iterator, Optional
 
 import librosa
 import numpy as np
@@ -30,7 +34,7 @@ import torch
 import torchaudio
 import yaml
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from nltk.tokenize import word_tokenize
 from pydantic import BaseModel, Field
 
@@ -57,18 +61,25 @@ to_mel = torchaudio.transforms.MelSpectrogram(
 )
 textcleaner = TextCleaner()
 
+DEFAULT_DIFFUSION_STEPS = 2
+DEFAULT_SPEED = 1.4
+DEFAULT_ALPHA = 0.0
+DEFAULT_BETA = 0.2
+
 
 class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Text to synthesize")
     voice: Optional[str] = Field(
         None, description="Voice id = pure wav stem (e.g. tara). Skips *_sample names."
     )
-    alpha: float = 0.0
-    beta: float = 0.2
-    diffusion_steps: int = 3
+    alpha: float = DEFAULT_ALPHA
+    beta: float = DEFAULT_BETA
+    diffusion_steps: int = DEFAULT_DIFFUSION_STEPS
     embedding_scale: float = 1.0
     pause_ms: int = 120
-    speed: float = Field(1.3, gt=0, description="Speaking rate via duration scaling (>1 faster)")
+    speed: float = Field(
+        DEFAULT_SPEED, gt=0, description="Speaking rate via duration scaling (>1 faster)"
+    )
 
 
 class AppState:
@@ -88,6 +99,11 @@ class AppState:
         self.synth_semaphore: Optional[asyncio.Semaphore] = None
         self.max_concurrent: int = 1
         self.in_flight: int = 0
+        self.fp16: bool = False
+        self.warmed_up: bool = False
+        self.require_cuda: bool = False
+        # Rolling synth latency samples (ms) for /health metrics
+        self.latency_ms: deque[float] = deque(maxlen=64)
 
 
 state = AppState()
@@ -103,8 +119,31 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.environ.get(name, default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _is_sample_voice(stem: str) -> bool:
     return stem.endswith("_sample")
+
+
+def _amp_context():
+    if state.fp16 and state.device == "cuda":
+        return torch.cuda.amp.autocast(dtype=torch.float16)
+    return nullcontext()
+
+
+def _percentile(values: list[float], p: float) -> Optional[float]:
+    if not values:
+        return None
+    xs = sorted(values)
+    if len(xs) == 1:
+        return round(xs[0], 1)
+    idx = min(len(xs) - 1, max(0, int(round((p / 100.0) * (len(xs) - 1)))))
+    return round(xs[idx], 1)
 
 
 def find_latest_checkpoint(log_dir: str) -> str:
@@ -156,9 +195,10 @@ def compute_style(path: str) -> torch.Tensor:
         audio = wave
     mel_tensor = preprocess(audio.astype(np.float32)).to(state.device)
     with torch.no_grad():
-        ref_s = state.model.style_encoder(mel_tensor.unsqueeze(1))
-        ref_p = state.model.predictor_encoder(mel_tensor.unsqueeze(1))
-    return torch.cat([ref_s, ref_p], dim=1)
+        with _amp_context():
+            ref_s = state.model.style_encoder(mel_tensor.unsqueeze(1))
+            ref_p = state.model.predictor_encoder(mel_tensor.unsqueeze(1))
+    return torch.cat([ref_s, ref_p], dim=1).float()
 
 
 def list_voice_wavs(voices_dir: str) -> list[tuple[str, Path]]:
@@ -292,12 +332,12 @@ def synthesize_sentence(
     text: str,
     ref_s: torch.Tensor,
     s_prev=None,
-    alpha: float = 0.0,
-    beta: float = 0.2,
+    alpha: float = DEFAULT_ALPHA,
+    beta: float = DEFAULT_BETA,
     t: float = 0.7,
-    diffusion_steps: int = 3,
+    diffusion_steps: int = DEFAULT_DIFFUSION_STEPS,
     embedding_scale: float = 1.0,
-    speed: float = 1.3,
+    speed: float = DEFAULT_SPEED,
     max_tokens: int = 500,
 ):
     text = text.strip().replace('"', "")
@@ -315,77 +355,115 @@ def synthesize_sentence(
     tokens = torch.LongTensor(tokens).to(state.device).unsqueeze(0)
     model = state.model
     model_params = state.model_params
+    ref_s = ref_s.float()
+    if s_prev is not None:
+        s_prev = s_prev.float()
 
     with torch.no_grad():
-        input_lengths = torch.LongTensor([tokens.shape[-1]]).to(state.device)
-        text_mask = length_to_mask(input_lengths).to(state.device)
+        with _amp_context():
+            input_lengths = torch.LongTensor([tokens.shape[-1]]).to(state.device)
+            text_mask = length_to_mask(input_lengths).to(state.device)
 
-        t_en = model.text_encoder(tokens, input_lengths, text_mask)
-        bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
-        d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+            t_en = model.text_encoder(tokens, input_lengths, text_mask)
+            bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
+            d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
-        s_pred = state.sampler(
-            noise=torch.randn((1, 256)).unsqueeze(1).to(state.device),
-            embedding=bert_dur,
+            s_pred = state.sampler(
+                noise=torch.randn((1, 256)).unsqueeze(1).to(state.device),
+                embedding=bert_dur,
+                embedding_scale=embedding_scale,
+                features=ref_s,
+                num_steps=diffusion_steps,
+            ).squeeze(1)
+
+            if s_prev is not None:
+                s_pred = t * s_prev + (1 - t) * s_pred
+
+            s = s_pred[:, 128:]
+            ref = s_pred[:, :128]
+            ref = alpha * ref + (1 - alpha) * ref_s[:, :128]
+            s = beta * s + (1 - beta) * ref_s[:, 128:]
+            s_pred = torch.cat([ref, s], dim=-1)
+
+            d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+            x, _ = model.predictor.lstm(d)
+            duration = torch.sigmoid(model.predictor.duration_proj(x)).sum(axis=-1)
+            pred_dur = torch.round(duration.squeeze() / speed).clamp(min=1)
+
+            pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().item()))
+            c_frame = 0
+            for i in range(pred_aln_trg.size(0)):
+                pred_aln_trg[i, c_frame : c_frame + int(pred_dur[i].item())] = 1
+                c_frame += int(pred_dur[i].item())
+
+            en = d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(state.device)
+            if model_params.decoder.type == "hifigan":
+                asr_new = torch.zeros_like(en)
+                asr_new[:, :, 0] = en[:, :, 0]
+                asr_new[:, :, 1:] = en[:, :, 0:-1]
+                en = asr_new
+
+            F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+
+            asr = t_en @ pred_aln_trg.unsqueeze(0).to(state.device)
+            if model_params.decoder.type == "hifigan":
+                asr_new = torch.zeros_like(asr)
+                asr_new[:, :, 0] = asr[:, :, 0]
+                asr_new[:, :, 1:] = asr[:, :, 0:-1]
+                asr = asr_new
+
+            out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+
+    return out.squeeze().float().cpu().numpy()[..., :-50], s_pred.float()
+
+
+def synthesize_text_chunks(
+    text: str,
+    ref_s: torch.Tensor,
+    alpha: float = DEFAULT_ALPHA,
+    beta: float = DEFAULT_BETA,
+    diffusion_steps: int = DEFAULT_DIFFUSION_STEPS,
+    embedding_scale: float = 1.0,
+    pause_ms: int = 120,
+    speed: float = DEFAULT_SPEED,
+    max_tokens: int = MAX_TOKENS,
+) -> Iterator[np.ndarray]:
+    """Yield float32 audio per token-budget chunk (progressive PCM; first chunk ASAP)."""
+    del pause_ms
+    chunks = chunk_by_tokens(text, max_tokens=max_tokens)
+    if not chunks:
+        raise ValueError("No sentences found in text")
+
+    s_prev = None
+    for chunk in chunks:
+        wav, s_prev = synthesize_sentence(
+            chunk,
+            ref_s,
+            s_prev=s_prev,
+            alpha=alpha,
+            beta=beta,
+            t=STYLE_BLEND_T,
+            diffusion_steps=diffusion_steps,
             embedding_scale=embedding_scale,
-            features=ref_s,
-            num_steps=diffusion_steps,
-        ).squeeze(1)
-
-        if s_prev is not None:
-            s_pred = t * s_prev + (1 - t) * s_pred
-
-        s = s_pred[:, 128:]
-        ref = s_pred[:, :128]
-        ref = alpha * ref + (1 - alpha) * ref_s[:, :128]
-        s = beta * s + (1 - beta) * ref_s[:, 128:]
-        s_pred = torch.cat([ref, s], dim=-1)
-
-        d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
-        x, _ = model.predictor.lstm(d)
-        duration = torch.sigmoid(model.predictor.duration_proj(x)).sum(axis=-1)
-        pred_dur = torch.round(duration.squeeze() / speed).clamp(min=1)
-
-        pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().item()))
-        c_frame = 0
-        for i in range(pred_aln_trg.size(0)):
-            pred_aln_trg[i, c_frame : c_frame + int(pred_dur[i].item())] = 1
-            c_frame += int(pred_dur[i].item())
-
-        en = d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(state.device)
-        if model_params.decoder.type == "hifigan":
-            asr_new = torch.zeros_like(en)
-            asr_new[:, :, 0] = en[:, :, 0]
-            asr_new[:, :, 1:] = en[:, :, 0:-1]
-            en = asr_new
-
-        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
-
-        asr = t_en @ pred_aln_trg.unsqueeze(0).to(state.device)
-        if model_params.decoder.type == "hifigan":
-            asr_new = torch.zeros_like(asr)
-            asr_new[:, :, 0] = asr[:, :, 0]
-            asr_new[:, :, 1:] = asr[:, :, 0:-1]
-            asr = asr_new
-
-        out = model.decoder(asr, F0_pred, N_pred, ref.squeeze().unsqueeze(0))
-
-    return out.squeeze().cpu().numpy()[..., :-50], s_pred
+            speed=speed,
+            max_tokens=max_tokens,
+        )
+        yield trim_pulse(wav.astype(np.float32))
 
 
 def synthesize_text(
     text: str,
     ref_s: torch.Tensor,
-    alpha: float = 0.0,
-    beta: float = 0.2,
-    diffusion_steps: int = 3,
+    alpha: float = DEFAULT_ALPHA,
+    beta: float = DEFAULT_BETA,
+    diffusion_steps: int = DEFAULT_DIFFUSION_STEPS,
     embedding_scale: float = 1.0,
-    pause_ms: int = 120,  # kept for API compat; ignored (crossfade used instead)
-    speed: float = 1.3,
+    pause_ms: int = 120,
+    speed: float = DEFAULT_SPEED,
     max_tokens: int = MAX_TOKENS,
 ) -> np.ndarray:
     """Synthesize with token-budget chunks, s_prev continuity, trim + crossfade joins."""
-    del pause_ms  # noqa: F841 — callers may still send it
+    del pause_ms
     chunks = chunk_by_tokens(text, max_tokens=max_tokens)
     if not chunks:
         raise ValueError("No sentences found in text")
@@ -421,6 +499,15 @@ def audio_to_wav_bytes(audio: np.ndarray, sr: int = SR) -> bytes:
     return buf.getvalue()
 
 
+def audio_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    peak = float(np.max(np.abs(audio))) + 1e-8
+    if peak > 1.0:
+        audio = audio / peak
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+    return pcm.tobytes()
+
+
 def _load_voice_styles(voices_dir: Optional[str]) -> None:
     state.styles = {}
     state.voices_dir = voices_dir
@@ -438,12 +525,68 @@ def _load_voice_styles(voices_dir: Optional[str]) -> None:
             print(f"  voice FAILED: {stem} ({path}): {e}", flush=True)
 
 
+def _maybe_torch_compile() -> None:
+    if not _env_bool("STYLETTS_TORCH_COMPILE", False):
+        return
+    if state.device != "cuda" or state.model is None:
+        return
+    try:
+        # Compile decoder only — highest cost after diffusion; safer than full graph.
+        state.model.decoder = torch.compile(state.model.decoder, mode="reduce-overhead")
+        print("torch.compile enabled on decoder", flush=True)
+    except Exception as exc:
+        print(f"torch.compile skipped: {exc}", flush=True)
+
+
+def _warmup_synthesis() -> None:
+    """Run a short synth so first real request is not cold."""
+    if state.model is None or state.ref_s is None:
+        return
+    voice = state.default_voice
+    ref_s = state.styles.get(voice, state.ref_s)
+    t0 = time.perf_counter()
+    try:
+        _ = synthesize_text(
+            "Hi there.",
+            ref_s,
+            alpha=DEFAULT_ALPHA,
+            beta=DEFAULT_BETA,
+            diffusion_steps=DEFAULT_DIFFUSION_STEPS,
+            speed=DEFAULT_SPEED,
+        )
+        if state.device == "cuda":
+            torch.cuda.synchronize()
+        ms = (time.perf_counter() - t0) * 1000.0
+        state.latency_ms.append(ms)
+        state.warmed_up = True
+        print(f"Warmup synth done in {ms:.1f}ms voice={voice}", flush=True)
+    except Exception as exc:
+        state.warmed_up = False
+        print(f"Warmup synth failed: {exc}", flush=True)
+
+
 def load_runtime():
     config_path = _env("CONFIG_PATH", "Configs/config_bimpe_ft.yml")
     voices_dir = _env("VOICES_DIR") or _env("STYLETTS_VOICES_DIR")
     default_voice = (_env("STYLETTS_DEFAULT_VOICE", "tara") or "tara").strip()
     ref_wav = _env("REF_WAV")
     log_dir_default = "Models/BimpeTTS_ft"
+
+    state.require_cuda = _env_bool("STYLETTS_REQUIRE_CUDA", True)
+    if state.require_cuda and state.device != "cuda":
+        raise RuntimeError(
+            "STYLETTS_REQUIRE_CUDA=1 but torch.cuda.is_available() is False. "
+            "Install a CUDA build of PyTorch and ensure the GPU is visible, "
+            "or set STYLETTS_REQUIRE_CUDA=0 to allow CPU (not suitable for <200ms TTFA)."
+        )
+    if state.device != "cuda":
+        print(
+            "WARNING: StyleTTS running on CPU — TTFA will be far above 200ms. "
+            "Use a CUDA torch build on a GPU host.",
+            flush=True,
+        )
+
+    state.fp16 = _env_bool("STYLETTS_FP16", state.device == "cuda")
 
     if not os.path.isfile(config_path):
         raise FileNotFoundError(f"CONFIG_PATH not found: {config_path}")
@@ -504,11 +647,9 @@ def load_runtime():
     elif ref_wav and os.path.isfile(ref_wav):
         state.ref_s = compute_style(ref_wav)
         state.ref_wav = ref_wav
-        # Register under default name if missing
         if default_voice and default_voice not in state.styles and not _is_sample_voice(default_voice):
             state.styles[default_voice] = state.ref_s
     elif state.styles:
-        # Fall back to first loaded voice
         first = sorted(state.styles)[0]
         state.default_voice = first
         state.ref_s = state.styles[first]
@@ -525,11 +666,15 @@ def load_runtime():
     state.in_flight = 0
     state.synth_semaphore = asyncio.Semaphore(max_c)
 
+    _maybe_torch_compile()
+    _warmup_synthesis()
+
     print(
-        f"TTS ready | device={device} | ckpt={ckpt} | epoch={epoch} "
-        f"| val_loss={val_loss} | default_voice={state.default_voice} "
-        f"| voices={sorted(state.styles)} | max_concurrent={max_c} "
-        f"| max_tokens={MAX_TOKENS} | crossfade_ms={CROSSFADE_MS}",
+        f"TTS ready | device={device} | fp16={state.fp16} | warmed_up={state.warmed_up} "
+        f"| ckpt={ckpt} | epoch={epoch} | val_loss={val_loss} "
+        f"| default_voice={state.default_voice} | voices={sorted(state.styles)} "
+        f"| max_concurrent={max_c} | diffusion_steps={DEFAULT_DIFFUSION_STEPS} "
+        f"| speed={DEFAULT_SPEED} | max_tokens={MAX_TOKENS}",
         flush=True,
     )
 
@@ -546,10 +691,13 @@ app = FastAPI(title="BimpeTTS StyleTTS2 Server", lifespan=lifespan)
 @app.get("/health")
 def health():
     ready = state.model is not None and state.ref_s is not None
+    samples = list(state.latency_ms)
     return {
         "status": "ok" if ready else "loading",
         "ready": ready,
         "device": state.device,
+        "fp16": state.fp16,
+        "warmed_up": state.warmed_up,
         "checkpoint": state.checkpoint_path,
         "ref_wav": state.ref_wav,
         "default_voice": state.default_voice,
@@ -557,6 +705,9 @@ def health():
         "voices_dir": state.voices_dir,
         "in_flight": state.in_flight,
         "max_concurrent": state.max_concurrent,
+        "synth_ms_p50": _percentile(samples, 50),
+        "synth_ms_p95": _percentile(samples, 95),
+        "synth_ms_samples": len(samples),
     }
 
 
@@ -568,17 +719,9 @@ def voices():
     }
 
 
-@app.post("/tts")
-async def tts(req: TTSRequest):
-    if state.model is None or state.ref_s is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
-    try:
-        voice_name, ref_s = resolve_ref_s(req.voice)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
+async def _synthesize_under_semaphore(req: TTSRequest, voice_name: str, ref_s: torch.Tensor):
     sem = state.synth_semaphore or asyncio.Semaphore(1)
+    queue_wait_started = time.perf_counter()
 
     def _run():
         return synthesize_text(
@@ -592,33 +735,147 @@ async def tts(req: TTSRequest):
             speed=req.speed,
         )
 
-    import time as _time
+    async with sem:
+        waited = time.perf_counter() - queue_wait_started
+        queue_wait_ms = waited * 1000.0
+        if waited > 0.05:
+            print(
+                f"[tts] queue wait {waited:.2f}s voice={voice_name} "
+                f"in_flight={state.in_flight}/{state.max_concurrent}",
+                flush=True,
+            )
+        state.in_flight += 1
+        synth_started = time.perf_counter()
+        try:
+            audio = await asyncio.to_thread(_run)
+            if state.device == "cuda":
+                await asyncio.to_thread(torch.cuda.synchronize)
+        finally:
+            state.in_flight = max(0, state.in_flight - 1)
+        synth_ms = (time.perf_counter() - synth_started) * 1000.0
+        state.latency_ms.append(synth_ms)
+        return audio, queue_wait_ms, synth_ms
 
-    queue_wait_started = _time.perf_counter()
+
+@app.post("/tts")
+async def tts(req: TTSRequest):
+    if state.model is None or state.ref_s is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
     try:
-        async with sem:
-            waited = _time.perf_counter() - queue_wait_started
-            if waited > 0.05:
-                print(
-                    f"[tts] queue wait {waited:.2f}s voice={voice_name} "
-                    f"in_flight={state.in_flight}/{state.max_concurrent}",
-                    flush=True,
-                )
-            state.in_flight += 1
-            try:
-                audio = await asyncio.to_thread(_run)
-            finally:
-                state.in_flight = max(0, state.in_flight - 1)
+        voice_name, ref_s = resolve_ref_s(req.voice)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    total_started = time.perf_counter()
+    try:
+        audio, queue_wait_ms, synth_ms = await _synthesize_under_semaphore(req, voice_name, ref_s)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS failed: {e}") from e
 
+    encode_started = time.perf_counter()
     wav_bytes = audio_to_wav_bytes(audio)
+    encode_ms = (time.perf_counter() - encode_started) * 1000.0
+    total_ms = (time.perf_counter() - total_started) * 1000.0
+    print(
+        f"[tts] voice={voice_name} chars={len(req.text)} "
+        f"queue_wait_ms={queue_wait_ms:.1f} synth_ms={synth_ms:.1f} "
+        f"encode_ms={encode_ms:.1f} total_ms={total_ms:.1f} device={state.device}",
+        flush=True,
+    )
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
-        headers={"X-StyleTTS-Voice": voice_name},
+        headers={
+            "X-StyleTTS-Voice": voice_name,
+            "X-StyleTTS-Synth-Ms": f"{synth_ms:.1f}",
+            "X-StyleTTS-Queue-Wait-Ms": f"{queue_wait_ms:.1f}",
+        },
+    )
+
+
+@app.post("/tts/stream")
+async def tts_stream(req: TTSRequest):
+    """Stream raw s16le mono 24 kHz PCM; first bytes after first synth chunk."""
+    if state.model is None or state.ref_s is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    try:
+        voice_name, ref_s = resolve_ref_s(req.voice)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    sem = state.synth_semaphore or asyncio.Semaphore(1)
+    queue_wait_started = time.perf_counter()
+
+    async def _gen() -> AsyncIterator[bytes]:
+        async with sem:
+            queue_wait_ms = (time.perf_counter() - queue_wait_started) * 1000.0
+            if queue_wait_ms > 50:
+                print(
+                    f"[tts/stream] queue wait {queue_wait_ms:.1f}ms voice={voice_name}",
+                    flush=True,
+                )
+            state.in_flight += 1
+            first = True
+            t0 = time.perf_counter()
+            err: list[BaseException] = []
+
+            def _producer(out_q: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
+                try:
+                    for wav in synthesize_text_chunks(
+                        req.text,
+                        ref_s,
+                        alpha=req.alpha,
+                        beta=req.beta,
+                        diffusion_steps=req.diffusion_steps,
+                        embedding_scale=req.embedding_scale,
+                        pause_ms=req.pause_ms,
+                        speed=req.speed,
+                    ):
+                        pcm = audio_to_pcm16_bytes(wav)
+                        asyncio.run_coroutine_threadsafe(out_q.put(pcm), loop).result()
+                except BaseException as exc:  # noqa: BLE001 — surface to async consumer
+                    err.append(exc)
+                finally:
+                    asyncio.run_coroutine_threadsafe(out_q.put(None), loop).result()
+
+            try:
+                loop = asyncio.get_running_loop()
+                q: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=4)
+                prod_fut = loop.run_in_executor(None, _producer, q, loop)
+                while True:
+                    item = await q.get()
+                    if item is None:
+                        break
+                    if first:
+                        first_byte_ms = (time.perf_counter() - t0) * 1000.0
+                        state.latency_ms.append(first_byte_ms)
+                        first = False
+                        print(
+                            f"[tts/stream] voice={voice_name} chars={len(req.text)} "
+                            f"ttfa_ms={first_byte_ms:.1f} queue_wait_ms={queue_wait_ms:.1f} "
+                            f"device={state.device}",
+                            flush=True,
+                        )
+                    yield item
+                await prod_fut
+                if err:
+                    raise err[0]
+            finally:
+                state.in_flight = max(0, state.in_flight - 1)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="application/octet-stream",
+        headers={
+            "X-StyleTTS-Voice": voice_name,
+            "X-StyleTTS-Sample-Rate": str(SR),
+            "X-StyleTTS-Encoding": "s16le",
+            "X-StyleTTS-Channels": "1",
+        },
     )
 
 
