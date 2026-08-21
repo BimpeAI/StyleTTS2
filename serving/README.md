@@ -1,65 +1,52 @@
-# StyleTTS2 HTTP TTS server
+# StyleTTS2 HTTP TTS server (notebook parity)
 
-Always-on FastAPI process for LiveKit agents. Optimized for **TTFA &lt; 200ms** on short first phrases (warm CUDA, non-queued).
+Audio matches `Demo/server_Inference_LibriTTS.ipynb` cell 25:
+
+`chunk_by_tokens(≤500)` → `LFinference` (`s_prev`, `t=0.7`) → `trim_pulse(15ms)` → `crossfade(80ms)`.
+
+Defaults: `alpha=0.3`, `beta=0.7`, `diffusion_steps=5`, `speed=1.0`, FP32.
 
 ## Run (GPU host)
 
 ```bash
 cd /path/to/StyleTTS2-1
 export CONFIG_PATH=Configs/config_bimpe_ft.yml
-export CHECKPOINT_PATH=Models/BimpeTTS_ft/best_2nd.pth
+export CHECKPOINT_PATH=Models/best_2nd_lite.pth   # same as notebook when available
 export VOICES_DIR=/path/to/voices
 export STYLETTS_DEFAULT_VOICE=tara
 export STYLETTS_MAX_CONCURRENT=1
-export STYLETTS_REQUIRE_CUDA=1
-export STYLETTS_FP16=1
-# export STYLETTS_TORCH_COMPILE=1   # optional, after validating quality
 
 uvicorn serving.tts_server:app --host 0.0.0.0 --port 8000
 ```
 
-Voice stems (lowercase; skip `*_sample`):  
-`agnes`, `bayo`, `bretheny`, `eli`, `femi`, `freda`, `james`, `kara`, `sarah`, `tara`, `temi`, `tobi`  
-— point `VOICES_DIR` at `bimpe-ai-onprem-realtime-STT/services/tts/voices/`.
-
-Defaults: `diffusion_steps=2`, `speed=1.4`, `alpha=0.0`, `beta=0.2`. Startup runs a short warmup synth.
+Voice stems: pure-name `.wav` under `VOICES_DIR` (skip `*_sample`). Compatible set:
+`bimpe-ai-onprem-realtime-STT/services/tts/voices/`.
 
 ## API
 
 | Method | Path | Notes |
 |--------|------|--------|
-| GET | `/health` | `ready`, `device`, `fp16`, `warmed_up`, `voices_loaded`, `in_flight`, `synth_ms_p50` / `p95` |
+| GET | `/health` | `ready`, `device`, `voices_loaded`, notebook `defaults` |
 | GET | `/voices` | list + default |
-| POST | `/tts` | JSON → `audio/wav` @ 24 kHz (smoke / fallback) |
-| POST | `/tts/stream` | JSON → chunked raw **s16le** mono 24 kHz (agents; low TTFA) |
+| POST | `/tts` | JSON → `audio/wav` @ 24 kHz (primary) |
+| POST | `/tts/stream` | Same synth as `/tts`, then raw s16le PCM of that waveform |
 
-Body: `{text, voice?, alpha?, beta?, diffusion_steps?, speed?}`.
-
-## Latency SLA
-
-- **In scope:** first PCM bytes for a short phrase (`"Hi there."`) with `device=cuda`, warmed model, `queue_wait≈0`.
-- **Out of scope:** finishing long paragraphs in &lt;200ms; multi-room queue wait.
-
-## Concurrency
-
-Default `STYLETTS_MAX_CONCURRENT=1`. Scale with **replicas**, not a high concurrent setting on one GPU.
+Body: `{text, voice?, alpha?, beta?, diffusion_steps?, embedding_scale?, speed?}`.
 
 ## Agents
 
 ```bash
-export STYLETTS_URL=http://127.0.0.1:8000   # same host preferred
+export STYLETTS_URL=http://127.0.0.1:8000
+export STYLETTS_ALPHA=0.3 STYLETTS_BETA=0.7 STYLETTS_DIFFUSION_STEPS=5 STYLETTS_SPEED=1.0
 python agent.py start
 ```
 
-See bimpe-agents `STYLETTS.md`.
+One LiveKit utterance → one server `synthesize_text` call (no client micro-chunking).
 
 ## Smoke
 
 ```bash
 curl -s "$STYLETTS_URL/health"
 curl -s -X POST "$STYLETTS_URL/tts" -H 'Content-Type: application/json' \
-  -d '{"text":"Hi there.","voice":"tara"}' -o /tmp/styletts_smoke.wav
-curl -s -X POST "$STYLETTS_URL/tts/stream" -H 'Content-Type: application/json' \
-  -d '{"text":"Hi there.","voice":"tara"}' -o /tmp/styletts.pcm
-# Server log should show ttfa_ms=… ; /health synth_ms_p50 after a few calls
+  -d '{"text":"Hello from StyleTTS.","voice":"tara"}' -o /tmp/styletts_smoke.wav
 ```
